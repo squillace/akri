@@ -1,0 +1,62 @@
+# This is the configuration for Porter
+# You must define steps for each action, but the rest is optional
+# See https://porter.sh/author-bundles for documentation on how to configure your bundle
+# Uncomment out the sections below to take full advantage of what Porter can do!
+
+name: akri
+version: 0.1.0
+description: "A CNAB bundle that installs and operates the installation of https://github.com/deislabs/akri, a Kubernetes device plugin implementation that makes it possible for you to name the device you want, find that device, and start using it right away."
+tag: ghcr.io/squillace/akri/akri:v0.1.0
+
+# If you want to customize the Dockerfile in use, uncomment the line below and update the referenced file. 
+# See https://porter.sh/custom-dockerfile/
+#dockerfile: Dockerfile.tmpl
+
+mixins:
+  - exec
+  - helm3:
+      clientVersion: v3.3.4
+      repositories:
+        akri-helm-charts:
+          url: "https://deislabs.github.io/akri"
+
+install:
+  - helm3:
+      description: "Use Helm 3 to deploy the akri helm chart."
+      upsert: true # uses "helm3 upgrade --install" instead of install. Can't use --replace.
+      name: akri # parameterize
+      chart: akri-helm-charts/akri
+#      version: CHART_VERSION
+      namespace: "{{bundle.parameters.akri-namespace}}"
+#      replace: true # removed to enable upsert behavior
+      wait: true # default true
+      set:
+        useLatestContainers: true
+        
+upgrade:
+  - exec:
+      description: "World 2.0"
+      command: bash
+      flags:
+          c: '"echo not yet implemented."'
+
+uninstall:
+  - helm3:
+      description: "Deleting akri resources."
+      name: akri # parameterize
+      chart: akri-helm-charts/akri
+      namespace: "{{bundle.parameters.akri-namespace}}"
+
+
+# Below is an example of how to define credentials
+# See https://porter.sh/author-bundles/#credentials
+credentials:
+  - name: kubeconfig
+    path: /root/.kube/config
+
+# Below is an example of how to define parameters
+# See https://porter.sh/author-bundles/#parameters
+parameters:
+  - name: akri-namespace
+    type: string
+    default: default
