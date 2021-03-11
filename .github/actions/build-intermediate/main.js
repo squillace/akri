@@ -32,7 +32,7 @@ async function shell_cmd(cmd) {
         if (core.getInput('github_event_name') == 'release') push_containers = 1;
         else if (core.getInput('github_event_name') == 'push' && 
                 core.getInput('github_ref') == 'refs/heads/main') push_containers = 1;
-        else if (core.getInput('github_event_name') == 'pull_request' && 
+        else if (core.getInput('github_event_name').startsWith('pull_request') && 
                 core.getInput('github_event_action') == 'closed' && 
                 core.getInput('github_ref') == 'refs/heads/main' && 
                 core.getInput('github_merged') == 'true') push_containers = 1;
@@ -41,17 +41,23 @@ async function shell_cmd(cmd) {
 
         var makefile_target_suffix = "";
         switch (core.getInput('platform')) {
-            case "amd64":   makefile_target_suffix = "amd64"; break;
-            case "arm32v7": makefile_target_suffix = "arm32"; break;
-            case "arm64v8": makefile_target_suffix = "arm64"; break;
+            case "amd64":   
+                process.env.BUILD_AMD64 = 1
+                makefile_target_suffix = "amd64"; 
+                break;
+            case "arm32v7": 
+                process.env.BUILD_ARM32 = 1
+                makefile_target_suffix = "arm32"; 
+                break;
+            case "arm64v8": 
+                process.env.BUILD_ARM64 = 1
+                makefile_target_suffix = "arm64"; 
+                break;
             default:
                 core.setFailed(`Failed with unknown platform: ${core.getInput('platform')}`)
                 return
         }
         console.log(`Makefile build target suffix: ${makefile_target_suffix}`)
-
-        console.log(`Login into Container Registry user=${core.getInput('container_registry_username')} repo=${core.getInput('container_registry_base_url')}`);
-        await shell_cmd(`echo "${core.getInput('container_registry_password')}" | docker login -u ${core.getInput('container_registry_username')} --password-stdin ${core.getInput('container_registry_base_url')}`);
 
         process.env.PREFIX = `${core.getInput('container_prefix')}`
 
@@ -59,6 +65,9 @@ async function shell_cmd(cmd) {
         await exec.exec(`make ${core.getInput('makefile_component_name')}-build-${makefile_target_suffix}`)
 
         if (push_containers == "1") {
+            console.log(`Login into Container Registry user=${core.getInput('container_registry_username')} repo=${core.getInput('container_registry_base_url')}`);
+            await shell_cmd(`echo "${core.getInput('container_registry_password')}" | docker login -u ${core.getInput('container_registry_username')} --password-stdin ${core.getInput('container_registry_base_url')}`);
+    
             console.log(`Push the versioned container: make ${core.getInput('makefile_component_name')}-docker-per-arch-${makefile_target_suffix}`)
             await exec.exec(`make ${core.getInput('makefile_component_name')}-docker-per-arch-${makefile_target_suffix}`)
         } else {

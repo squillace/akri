@@ -8,7 +8,6 @@ on:
     - '**.rs'
     - '**/Cargo.toml'
     - '**/Cargo.lock'
-    - build/setup.sh
   pull_request:
     branches: [ main ]
     paths:
@@ -16,27 +15,42 @@ on:
     - '**.rs'
     - '**/Cargo.toml'
     - '**/Cargo.lock'
-    - build/setup.sh
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  security_audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v1
+      - uses: actions-rs/audit-check@v1
+        with:
+          # token is only used for creating the audit report and does not impact the 
+          # functionality or success/failure of the job in case the token is unavailable 
+          token: ${{ secrets.GITHUB_TOKEN }}
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-    - uses: actions/checkout@v2
+    - name: Checkout the head commit of the branch
+      uses: actions/checkout@v2
+      with:
+        persist-credentials: false
+
     - name: Rust install
       uses: actions-rs/toolchain@v1
       with:
-        toolchain: 1.41.0
+        toolchain: 1.49.0
         override: true
         components: clippy, rustfmt
-    - name: Install linux requirement
-      run: ./build/setup.sh
+    - name: Install Linux requirements
+      run: |
+        apt_dependencies="git curl libssl-dev pkg-config libudev-dev libv4l-dev"
+        echo "Run apt update and apt install the following dependencies: $apt_dependencies"
+        sudo apt update
+        sudo apt install -y $apt_dependencies
     - name: Check rust format
       run: cargo fmt --all -- --check
     - name: Check clippy

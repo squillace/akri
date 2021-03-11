@@ -1,60 +1,82 @@
-# End to End Demo   
-This demo will demonstrate end to end Akri flow, all the way from discovering local video cameras to the footage being streamed on a web application. This will show how akri can dynamically discover devices, deploy brokers pods to perform some action on a device (in this case grabing video frames and serving them over gRPC), and deploy broker services for obtaining the results of that action.
+# End-to-End Demo
+In this guide, we will walk through using Akri to discover mock USB cameras attached to nodes in a Kubernetes cluster. You'll see how Akri automatically deploys workloads to pull frames from the cameras. We will then deploy a streaming application that will point to services automatically created by Akri to access the video frames from the workloads.
 
-## Set up single node cluster using MicroK8s
-1. Acquire an Ubuntu 18.04 LTS or 16.04 LTS environment to run the commands.
-1. Install [MicroK8s](https://microk8s.io/docs).
-    ```sh
-    sudo snap install microk8s --classic --channel=1.18/stable
-    ```
-1. Grant admin privilege for running MicroK8s commands.
-    ```sh
-    sudo usermod -a -G microk8s $USER
-    sudo chown -f -R $USER ~/.kube
-    su - $USER
-    ```
-1. Check MicroK8s status.
-    ```sh
-    microk8s status --wait-ready
-    ```
-1. If you don't have an existing `kubectl` installation, add a kubectl alias. If you do not want to set an alias, add `microk8s` in front of all kubectl commands.
-    ```sh
-    alias kubectl='microk8s kubectl'
-    ```
-1. Install Helm.
-    ```sh
-    sudo apt install -y curl
-    curl -L https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
-    ```
-1. Enable Helm for MicroK8s.
-    ```sh
-    kubectl config view --raw >~/.kube/config
-    microk8s enable helm3
-    ```
-1. Enable dns.
-    ```sh
-    microk8s enable dns
-    ```
-1. Enable privileged pods and restart microk8s.
-    ```sh
-    echo "--allow-privileged=true" >> /var/snap/microk8s/current/args/kube-apiserver
-    microk8s.stop
-    microk8s.start
-    ```
-1. Since MicroK8s by default does not have a node with the label `node-role.kubernetes.io/master=`, add the label to the control plane node so the controller gets scheduled.
-    ```sh
-    kubectl label node ${HOSTNAME,,} node-role.kubernetes.io/master= --overwrite=true
-    ```
-1. Apply Docker secret to cluster in order to pull down Akri Agent, Controller, Broker, and Sample App pods.
-    ```sh
-    kubectl create secret docker-registry regcred --docker-server=ghcr.io  --docker-username=<request username> --docker-password=<request password>
-    ```
+The following will be covered in this demo:
+1. Setting up mock udev video devices
+1. Setting up a cluster
+1. Installing Akri via Helm with settings to create your Akri udev Configuration
+1. Inspecting Akri
+1. Deploying a streaming application
+1. Cleanup
+1. Going beyond the demo
 
-## Set up single node cluster using K3s
-1. Acquire a Linux distro that is supported by K3s, these steps work for Ubuntu.
-1. Install [K3s](https://k3s.io/).
+## Setting up mock udev video devices
+1. Acquire an Ubuntu 20.04 LTS, 18.04 LTS or 16.04 LTS environment to run the
+   commands. If you would like to deploy the demo to a cloud-based VM, see the
+   instructions for [DigitalOcean](end-to-end-demo-do.md) or [Google Compute
+   Engine](end-to-end-demo-gce.md) (and you can skip the rest of the steps in
+   this document).
+1. To setup fake usb video devices, install the v4l2loopback kernel module and its prerequisites. Learn more about v4l2 loopback [here](https://github.com/umlaeute/v4l2loopback)
     ```sh
-    curl -sfL https://get.k3s.io | sh -
+    sudo apt update
+    sudo apt -y install linux-headers-$(uname -r)
+    sudo apt -y install linux-modules-extra-$(uname -r)
+    sudo apt -y install dkms
+    curl http://deb.debian.org/debian/pool/main/v/v4l2loopback/v4l2loopback-dkms_0.12.5-1_all.deb -o v4l2loopback-dkms_0.12.5-1_all.deb
+    sudo dpkg -i v4l2loopback-dkms_0.12.5-1_all.deb
+    ```
+    > **Note** When running on Ubuntu 20.04 LTS, 18.04 LTS or 16.04 LTS, do NOT install 
+    > v4l2loopback  through `sudo apt install -y v4l2loopback-dkms`, you will get an older version (0.12.3). 
+    > 0.12.5-1 is required for gstreamer to work properly.
+
+
+    > **Note**: If not able to install the debian package of v4l2loopback due to using a different
+    > Linux kernel, you can clone the repo, build the module, and setup the module dependencies 
+    > like so:
+    > ```sh
+    > git clone https://github.com/umlaeute/v4l2loopback.git
+    > cd v4l2loopback
+    > make & sudo make install
+    > sudo make install-utils
+    > sudo depmod -a  
+    > ```
+    
+1. "Plug-in" two cameras by inserting the kernel module. To create different number video devices modify the `video_nr` argument. 
+    ```sh
+    sudo modprobe v4l2loopback exclusive_caps=1 video_nr=1,2
+    ```
+1. Confirm that two video device nodes (video1 and video2) have been created.
+    ```sh
+    ls /dev/video*
+    ```
+1. Install the necessary Gstreamer packages.
+    ```sh
+    sudo apt-get install -y \
+        libgstreamer1.0-0 gstreamer1.0-tools gstreamer1.0-plugins-base \
+        gstreamer1.0-plugins-good gstreamer1.0-libav
+    ```
+1. Now that our cameras are set up, lets use Gstreamer to pass fake video streams through them.
+    ```sh
+    mkdir camera-logs
+    sudo gst-launch-1.0 -v videotestsrc pattern=ball ! "video/x-raw,width=640,height=480,framerate=10/1" ! avenc_mjpeg ! v4l2sink device=/dev/video1 > camera-logs/ball.log 2>&1 &
+    sudo gst-launch-1.0 -v videotestsrc pattern=smpte horizontal-speed=1 ! "video/x-raw,width=640,height=480,framerate=10/1" ! avenc_mjpeg ! v4l2sink device=/dev/video2 > camera-logs/smpte.log 2>&1 &
+    ```
+    > **Note**: If this generates an error, be sure that there are no existing video streams targeting the video device nodes by running the following and then re-running the previous command:
+    > ```sh
+    > if pgrep gst-launch-1.0 > /dev/null; then
+    >   sudo pkill -9 gst-launch-1.0
+    > fi
+    > ```
+
+## Setting up a cluster
+
+**Note:** Feel free to deploy on any Kubernetes distribution. Here, find instructions for K3s and MicroK8s. Select and
+carry out one or the other (or adapt to your distribution), then continue on with the rest of the steps. 
+
+### Option 1: Set up single node cluster using K3s
+1. Install [K3s](https://k3s.io/) v1.18.9+k3s1.
+    ```sh
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.18.9+k3s1 sh -
     ```
 1. Grant admin privilege to access kubeconfig.
     ```sh
@@ -75,106 +97,115 @@ This demo will demonstrate end to end Akri flow, all the way from discovering lo
     sudo apt install -y curl
     curl -L https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
     ```
-1. Since K3s by default does not have a node with the label `node-role.kubernetes.io/master=`, add the label to the control plane node so the controller gets scheduled.
+1. K3s uses its own embedded crictl, so we need to configure the Akri Helm chart with the k3s crictl path and socket.
     ```sh
-    kubectl label node ${HOSTNAME,,} node-role.kubernetes.io/master= --overwrite=true
-    ```
-1. Apply Docker secret to cluster in order to pull down Akri Agent, Controller, Broker, and Sample App pods.
-    ```sh
-    kubectl create secret docker-registry regcred --docker-server=ghcr.io  --docker-username=<request username> --docker-password=<request password>
-    ```
-1. Set up role-based access control (RBAC): Since Akri does not have RBAC policy set up yet, for now, grant all pods admin access.
-    ```sh
-    kubectl create clusterrolebinding serviceaccounts-cluster-admin --clusterrole=cluster-admin --group=system:serviceaccounts
+    export AKRI_HELM_CRICTL_CONFIGURATION="--set agent.host.crictl=/usr/local/bin/crictl --set agent.host.dockerShimSock=/run/k3s/containerd/containerd.sock"
     ```
 
-## Set up mock udev video devices
-1. Install a kernel module to make v4l2 loopback video devices. Learn more about this module [here](https://github.com/umlaeute/v4l2loopback).
+### Option 2: Set up single node cluster using MicroK8s
+1. Install [MicroK8s](https://microk8s.io/docs).
     ```sh
-    curl http://deb.debian.org/debian/pool/main/v/v4l2loopback/v4l2loopback-dkms_0.12.5-1_all.deb -o v4l2loopback-dkms_0.12.5-1_all.deb
-    sudo dpkg -i v4l2loopback-dkms_0.12.5-1_all.deb
+    sudo snap install microk8s --classic --channel=1.18/stable
     ```
-1. Insert the kernel module, creating /dev/video1 and /dev/video2 devnodes. To create different number video devices modify the `video_nr` argument. 
+1. Grant admin privilege for running MicroK8s commands.
     ```sh
-    sudo modprobe v4l2loopback exclusive_caps=1 video_nr=1,2
+    sudo usermod -a -G microk8s $USER
+    sudo chown -f -R $USER ~/.kube
+    su - $USER
     ```
-1. Install Gstreamer main packages
+1. Check MicroK8s status.
     ```sh
-    sudo apt-get install -y libgstreamer1.0-0 gstreamer1.0-dev gstreamer1.0-tools \
-                            gstreamer1.0-doc gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-                            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
-                            gstreamer1.0-libav gstreamer1.0-doc gstreamer1.0-tools \
-                            gstreamer1.0-x gstreamer1.0-alsa gstreamer1.0-gl gstreamer1.0-gtk3 \
-                            gstreamer1.0-qt5 gstreamer1.0-pulseaudio 
+    microk8s status --wait-ready
     ```
-1. Open two new terminals (one for each fake video device), and in each terminal ssh into your ubuntu server that your cluster is running on.
-1. In one terminal, stream a test video of a white ball moving around a black background from the first fake video device.
+1. Enable CoreDNS, Helm and RBAC for MicroK8s.
     ```sh
-    sudo gst-launch-1.0 -v videotestsrc pattern=ball ! "video/x-raw,width=640,height=480,framerate=10/1" ! avenc_mjpeg ! v4l2sink device=/dev/video1
+    microk8s enable dns helm3 rbac
     ```
-    If this generates an error, be sure that there are no existing video streams targeting /dev/video1 (you can query with commands like this: `ps -aux | grep gst-launch-1.0 | grep "/dev/video1"`).
-1. In the other terminal, stream a test video of SMPTE 100%% color bars moving horizontally from the second fake video device.
+1. If you don't have an existing `kubectl` and `helm` installations, add aliases. If you do not want to set an alias, add `microk8s` in front of all `kubectl` and `helm` commands.
     ```sh
-    sudo gst-launch-1.0 -v videotestsrc pattern=smpte horizontal-speed=1 ! "video/x-raw,width=640,height=480,framerate=10/1" ! avenc_mjpeg ! v4l2sink device=/dev/video2
+    alias kubectl='microk8s kubectl'
+    alias helm='microk8s helm3'
     ```
-    If this generates an error, be sure that there are no existing video streams targeting /dev/video1 (you can query with commands like this: `ps -aux | grep gst-launch-1.0 | grep "/dev/video2"`).
+1. For the sake of this demo, the udev video broker pods run privileged to easily grant them access to video devices, so
+   enable privileged pods and restart MicroK8s. More explicit device access could have been configured by setting the
+   appropriate [security context](udev-configuration.md#setting-the-broker-pod-security-context) in the broker PodSpec
+   in the Configuration.
+    ```sh
+    echo "--allow-privileged=true" >> /var/snap/microk8s/current/args/kube-apiserver
+    microk8s.stop
+    microk8s.start
+    ```
+1. Akri depends on crictl to track some Pod information. MicroK8s does not install crictl locally, so crictl must be installed and the Akri Helm chart needs to be configured with the crictl path and MicroK8s containerd socket.
+    ```sh
+    # Note that we aren't aware of any version restrictions
+    VERSION="v1.17.0"
+    curl -L https://github.com/kubernetes-sigs/cri-tools/releases/download/$VERSION/crictl-${VERSION}-linux-amd64.tar.gz --output crictl-${VERSION}-linux-amd64.tar.gz
+    sudo tar zxvf crictl-$VERSION-linux-amd64.tar.gz -C /usr/local/bin
+    rm -f crictl-$VERSION-linux-amd64.tar.gz
 
-## Set up Akri
-1. Install Akri Helm chart and enable the udev video configuration which will search for all video devices on the node, as specified by the udev rule `KERNEL=="video[0-9]*"` in the configuration. Since the /dev/video1 and /dev/video2 devices are running on this node, the Akri Agent will discover them and create an Instance for each camera. Watch two broker pods spin up, one for each camera.
+    export AKRI_HELM_CRICTL_CONFIGURATION="--set agent.host.crictl=/usr/local/bin/crictl --set agent.host.dockerShimSock=/var/snap/microk8s/common/run/containerd.sock"
+    ```
+
+## Installing Akri
+You tell Akri what you want to find with an Akri Configuration, which is one of Akri's Kubernetes custom resources. The Akri Configuration is simply a `yaml` file that you apply to your cluster. Within it, you specify three things: 
+1. a discovery protocol
+2. any additional device filtering
+3. an image for a Pod (that we call a "broker") that you want to be automatically deployed to utilize each discovered device
+
+For this demo, we will specify (1) Akri's udev discovery protocol, which is used to discover devices in the Linux device file system. Akri's udev discovery protocol supports (2) filtering by udev rules. We want to find all video devices in the Linux device file system, which can be specified by the udev rule `KERNEL=="video[0-9]*"`. Say we wanted to be more specific and only discover devices made by Great Vendor, we could adjust our rule to be `KERNEL=="video[0-9]*"\, ENV{ID_VENDOR}=="Great Vendor"`. For (3) a broker Pod image, we will use a sample container that Akri has provided that pulls frames from the cameras and serves them over gRPC. 
+
+Instead of having to build a Configuration from scratch, Akri has provided [Helm templates](../deployment/helm/templates) for each supported discovery protocol. Lets customize the generic [udev Helm template](../deployment/helm/templates/udev.yaml) with our three specifications above. We can also set the name for the Configuration to be `akri-udev-video`. Also, if using MicroK8s or K3s, configure the crictl path and socket using the `AKRI_HELM_CRICTL_CONFIGURATION` variable created when setting up your cluster. 
+
+1. Add the Akri Helm chart and run the install command, setting Helm values as described above.
     ```sh
     helm repo add akri-helm-charts https://deislabs.github.io/akri/
     helm install akri akri-helm-charts/akri \
-        --set imagePullSecrets[0].name="regcred" \
-        --set useLatestContainers=true \
-        --set udevVideo.enabled=true \
-        --set udevVideo.udevRules[0]='KERNEL==\"video[0-9]*\"'
+        $AKRI_HELM_CRICTL_CONFIGURATION \
+        --set udev.enabled=true \
+        --set udev.name=akri-udev-video \
+        --set udev.udevRules[0]='KERNEL=="video[0-9]*"' \
+        --set udev.brokerPod.image.repository="ghcr.io/deislabs/akri/udev-video-broker"
     ```
-    For MicroK8s
+
+## Inspecting Akri
+After installing Akri, since the /dev/video1 and /dev/video2 devices are running on this node, the Akri Agent will discover them and create an Instance for each camera. 
+
+1. List all that Akri has automatically created and deployed, namely the Akri Configuration we created when installing Akri, two Instances (which are the Akri custom resource that represents each device), two broker Pods (one for each camera), a service for each broker Pod, and a service for all brokers.
+
     ```sh
-    watch microk8s kubectl get pods,akric,akrii -o wide
+    watch microk8s kubectl get pods,akric,akrii,services -o wide
     ```
     For K3s and vanilla Kubernetes
     ```sh
-    watch kubectl get pods,akric,akrii -o wide
+    watch kubectl get pods,akric,akrii,services -o wide
     ```
-    Run `kubectl get crd`, and you should see the crds listed.
-    Run `kubectl get pods -o wide`, and you should see the Akri pods.
-    Run `kubectl get akric`, and you should see `akri-udev-video`. If IP cameras were discovered and pods spun up, the instances can be seen by running `kubectl get akrii` and further inspected by runing `kubectl get akrii akri-udev-video-<ID> -o yaml`
-
-1. Inspect the two instances, seeing the correct devnodes in the metadata and that one of the usage slots for each instance was reserved for this node.
+Look at the Configuration and Instances in more detail. 
+1. Inspect the Configuration that was created via the Akri udev Helm template and values that were set when installing Akri by running the following.
+    ```sh
+    kubectl get akric -o yaml
+    ```
+1. Inspect the two Instances. Notice that in the metadata of each instance, you can see the device nodes (`/dev/video1` or `/dev/video2`) that the Instance represents. This metadata of each Instance was passed to it's broker Pod as an environment variable. This told the broker which device to connect to. We can also see in the Instance a usage slot and that it was reserved for this node. Each Instance represents a device and its usage.
     ```sh 
     kubectl get akrii -o yaml
     ```
-1. Deploy the steaming web application and watch a pod spin up for the app.
+    If this was a shared device (such as an IP camera), you may have wanted to increase the number of nodes that could use the same device by specifying `capacity`. There is a `capacity` parameter for each protocol, which defaults to `1`. Its value could have been increased when installing Akri (via `--set <protocol>.capacity=2` to allow 2 nodes to use the same device) and more usage slots (the number of usage slots is equal to `capacity`) would have been created in the Instance. 
+## Deploying a streaming application
+1. Deploy a video streaming web application that points to both the Configuration and Instance level services that were automatically created by Akri.
     ```sh
-    # This file url is not available while the Akri repo is private.  To get a valid url, open 
-    # https://github.com/deislabs/akri/blob/main/deployment/samples/akri-video-streaming-app.yaml
-    # and click the "Raw" button ... this will generate a link with a token that can be used below.
-    curl -o akri-video-streaming-app.yaml <RAW LINK WITH TOKEN>
-    kubectl apply -f akri-video-streaming-app.yaml
+    kubectl apply -f https://raw.githubusercontent.com/deislabs/akri/main/deployment/samples/akri-video-streaming-app.yaml
+    watch kubectl get pods
     ```
-    For MicroK8s
+1. Determine which port the service is running on. Be sure to save this port number for the next step.
     ```sh
-    watch microk8s kubectl get pods -o wide
-    ```
-    For K3s and vanilla Kubernetes
+   kubectl get service/akri-video-streaming-app --output=jsonpath='{.spec.ports[?(@.name=="http")].nodePort}' && echo
+   ```
+1.  SSH port forwarding can be used to access the streaming application. In a new terminal, enter your ssh command to to access your VM followed by the port forwarding request. The following command will use port 50000 on the host. Feel free to change it if it is not available. Be sure to replace `<streaming-app-port>` with the port number outputted in the previous step. 
     ```sh
-    watch kubectl get pods -o wide
+    ssh someuser@<Ubuntu VM IP address> -L 50000:localhost:<streaming-app-port>
     ```
-1. Determine which port the service is running on.
-    ```sh
-    kubectl get services
-    ```
-    Something like the following will be displayed. The ids of the camera services (`udev-camera-<id>-svc`) will likely be different as they are determined by hostname.
-    ```
-    NAME                     TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)        AGE
-    kubernetes               ClusterIP   10.XXX.XXX.X     <none>        443/TCP        2d5h
-    streaming                NodePort    10.XXX.XXX.XX    <none>        80:31143/TCP   41m
-    udev-camera-901a7b-svc   ClusterIP   10.XXX.XXX.XX    <none>        80/TCP         42m
-    udev-camera-e2548e-svc   ClusterIP   10.XXX.XXX.XX    <none>        80/TCP         42m
-    udev-camera-svc          ClusterIP   10.XXX.XXX.XXX   <none>        80/TCP         42m
-    ```
-1. Navigate in your browser to http://ip-address:31143/ where ip-address is the IP address of your ubuntu VM and the port number is from the output of `kubectl get services`. You should see three videos. The top video streams frames from all udev cameras (from the overarching `udev-camera-svc` service), while each of the bottom videos displays the streams from each of the individual camera services (`udev-camera-901a7b-svc` and `udev-camera-e2548e-svc`). Note: the streaming web application displays at a rate of 1 fps.
+    > **Note** we've noticed issues with port forwarding with WSL 2. Please use a different terminal.
+1. Navigate to `http://localhost:50000/`. The large feed points to Configuration level service (`udev-camera-svc`), while the bottom feed points to the service for each Instance or camera (`udev-camera-svc-<id>`).
+
 
 ## Cleanup 
 1. Bring down the streaming service.
@@ -190,7 +221,7 @@ This demo will demonstrate end to end Akri flow, all the way from discovering lo
     ```sh
     watch kubectl get pods
     ```
-1. Delete the configuration and watch the instances, pods, and services be deleted.
+1. Delete the configuration, and watch the associated instances, pods, and services be deleted.
     ```sh
     kubectl delete akric akri-udev-video
     ```
@@ -202,21 +233,29 @@ This demo will demonstrate end to end Akri flow, all the way from discovering lo
     ```sh
     watch kubectl get pods,services,akric,akrii -o wide
     ```
-1. Bring down the Akri Agent, Controller, and CRDs.
+1. If you are done using Akri, it can be uninstalled via Helm.
     ```sh
     helm delete akri
+    ```
+1. Delete Akri's CRDs.
+    ```sh
     kubectl delete crd instances.akri.sh
     kubectl delete crd configurations.akri.sh
     ```
-1. Stop video streaming on dummy devices and remove kernel module.
+1. Stop video streaming from the video devices.
     ```sh
-    # If terminal has timed out, search for process to kill.
-    # ps ax | grep gst-launch-1.0
-    # sudo kill <PID>
+    if pgrep gst-launch-1.0 > /dev/null; then
+        sudo pkill -9 gst-launch-1.0
+    fi
+    ```
+1. "Unplug" the fake video devices by removing the kernel module.
+    ```sh
     sudo modprobe -r v4l2loopback
     ```
 
 ## Going beyond the demo
-1. Apply the [onvif-camera configuration](onvif-sample.md) and make the streaming app display footage from both the local video devices and onvif cameras. To do this, modify the [video streaming yaml](../deployment/samples/akri-video-streaming-app.yaml) as described in the inline comments in order to create a larger service that aggregates the output from both the `udev-camera-svc` service and `onvif-camera-svc` service.
+1. Plug in real cameras! You can [pass environment variables](./udev-video-sample.md#modifying-the-brokerpod-spec) to the frame server broker to specify the format, resolution width/height, and frames per second of your cameras.
+1. Apply the [ONVIF configuration](onvif-configuration.md) and make the streaming app display footage from both the local video devices and onvif cameras. To do this, modify the [video streaming yaml](../deployment/samples/akri-video-streaming-app.yaml) as described in the inline comments in order to create a larger service that aggregates the output from both the `udev-camera-svc` service and `onvif-camera-svc` service.
 1. Add more nodes to the cluster.
-1. Discover other udev devices by creating a new udev configuration and broker. Learn more about the udev protocol [here](udev-sample.md).
+1. [Modify the udev rule](udev-video-sample.md#modifying-the-udev-rule) to find a more specific subset of cameras.
+1. Discover other udev devices by creating a new udev configuration and broker. Learn more about the udev protocol [here](udev-configuration.md).

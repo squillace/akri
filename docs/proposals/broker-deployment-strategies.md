@@ -12,6 +12,12 @@ if you pass a second Configuration. This is a fairly specific implementation tha
 The next section discusses some ways the Akri Controller and Agent could be extended to allow for other broker
 deployment strategies.
 ## New Deployment Strategies
+### DeploymentSpec-based
+Unlike a DaemonSet, where each broker is deployed once to each node (bounded by Configuration.Capacity), a 
+DeploymentSpec-based approach could be provided.  With this approach, the number of brokers deployed would be governed by the minimum of Deployment.Replicas and Configuration.Capacity.  Brokers would be scheduled by the default Kubernetes scheduler.
+
+One benefit to this would be high availability for non-shared Instances (currently, using the DaemonSet paradigm, only 1 broker is deployed per non-shared Instance), as the number of deployed brokers would be configured by Deployment.Replicas.
+
 ### Instance Pooling
 With regular [Kubernetes device
 plugins](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/), operators can
@@ -26,17 +32,17 @@ kind: Configuration
 metadata:
   name: akri-onvif-video
 spec:
-  protocol:
-    onvif:
-      ipAddresses: 
-        action: Exclude
-        items: []
+  discoveryHandler:
+    name: onvif
+    discoveryDetails: |+
+        ipAddresses: 
+          action: Exclude
+          items: []
     # ...
   brokerPodSpec:
     containers:
     - name: akri-onvif-video-broker
       image: "ghcr.io/..."
-      imagePullPolicy: Always
       resources:
         limits:
           "{{PLACEHOLDER}}" : "1"
@@ -63,6 +69,12 @@ several possibilities for supporting **dynamic instance pooling**:
    connection information to the main broker container. This would reduce the amount of changes a user would have to
    make to their broker; however, they would have to implement this separate container. Or maybe this could be
    generalized.
+1. The Controller could create a ConfigMap with metadata about instances that are assigned to a specific broker and 
+   mount this ConfigMap into the broker as a volume. When the Controller wants to change the assignment of instances
+   to brokers, it just needs to update the ConfigMaps. The changes are propagated into the broker mounted volumes and 
+   brokers can adjust accordingly (see [Kubernetes 
+   docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-pod-configmap/#mounted-configmaps-are-updated-automatically) 
+   for reference).
 
 A more immediate solution would be to implement **static instance pooling**. The `instance-pooling` value would define
 the exact number of Instance that must be available for a broker to be scheduled. If `instance-pooling` is set to 3 and

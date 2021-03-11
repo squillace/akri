@@ -1,476 +1,695 @@
 # Extensibility
-While Akri has several [currently supported discovery protocols](./roadmap.md#currently-supported-protocols) and sample brokers and applications to go with them, the protocol you want to use to discover resources may not be implemented yet. This walks you through all the development steps needed to implement a new protocol and sample broker. It will also cover the steps to get your protocol and broker[s] added to Akri, should you wish to contribute them back. 
 
-To add a new protocol implementation, three things are needed:
-1. Add a new DiscoveryHandler implementation in the Akri Agent
-1. Update the Configuration CRD to include the new DiscoveryHandler implementation
-1. Create a protocol broker for the new capability
+Akri has [implemented several discovery protocols](./roadmap.md#currently-supported-protocols) with sample brokers and
+applications. However, there may be protocols you would like to use to discover resources that have not been implemented
+yet.  To enable the discovery of resources via a new protocol, you will implement a Discovery Handler (DH), which does
+discovery on behalf of the Agent. A Discovery Handler is anything that implements the `Discovery` service and
+`Registration` client defined in the [Akri's discovery gRPC proto file](../discovery-utils/proto/discovery.proto). These
+DHs run as their own Pods and are expected to register with the Agent, which hosts the `Registration` service defined in
+the gRPC interface. A discovery handler can be written in any language using protobuf; however, Akri has provided a
+template for accelerating creating a discovery handler in Rust.  
 
-## The mythical Loch Ness resource
-To demonstrate how new protocols can be added, we will create a protocol to discover Nessie, a mythical Loch Ness monster that lives at a specific url.
+This document will walk you through the development steps to implement a Discovery Handler and sample broker that
+utilizes exposed devices. This document will also cover the steps to get your Discovery Handler and broker added to
+Akri, should you wish to [contribute them back](./contributing.md).
 
-### New DiscoveryHandler implementation
-If the resource you are interested in defining is not accessible through the [included protocols](./roadmap.md#currently-supported-protocols), then you will need to create a DiscoveryHandler for your new protocol.  For the sake of demonstration, we will create a discovery handler in order to discover mythical Nessie resources.
+Before continuing, please read the [Akri architecture](./architecture.md), [Akri agent](./agent-in-depth.md), and
+[development](./development.md) documentation pages.  They will provide a good understanding of Akri, how it works, what
+components it is composed of, and how to build it.
+> **Note:** a Discovery Handler can use any set of steps to discover devices. It does not have to be a "protocol" in the
+> traditional sense. For example, Akri defines udev (not often called a "protocol") and OPC UA as protocols.
 
-New protocols require new implementations of the DiscoveryHandler:
+Here, we will create a Discovery Handler to discover **HTTP-based devices** that publish random sensor data.
 
-```rust
-#[async_trait]
-pub trait DiscoveryHandler {
-    async fn discover(&self) -> Result<Vec<DiscoveryResult>, Error>;
-    fn are_shared(&self) -> Result<bool, Error>;
-}
+Any Docker-compatible container registry will work for hosting the containers being used in this example (Docker Hub,
+Github Container Registry, Azure Container Registry, etc).  Here, we are using the [GitHub Container
+Registry](https://github.blog/2020-09-01-introducing-github-container-registry/). You can follow the [getting started
+guide here to enable it for
+yourself](https://docs.github.com/en/free-pro-team@latest/packages/getting-started-with-github-container-registry).
+
+> **Note:** if your container registry is private, you will need to create a kubernetes secret (`kubectl create secret
+> docker-registry crPullSecret --docker-server=<cr>  --docker-username=<cr-user> --docker-password=<cr-token>`) and
+> access it with an `imagePullSecret`.  Here, we will assume the secret is named `crPullSecret`.
+
+## New DiscoveryHandler implementation
+### Use `cargo generate` to clone the Discovery Handler template
+Pull down the [Discovery Handler template](https://github.com/kate-goldenring/akri-discovery-handler-template) using
+[`cargo-generate`](https://github.com/cargo-generate/cargo-generate). 
+```sh 
+cargo install cargo-generate
+cargo generate --git https://github.com/kate-goldenring/akri-discovery-handler-template.git --name akri-http-discovery-handler
 ```
+### Specify the DiscoveryHandler name and whether discovered devices are sharable
+Inside the newly created `akri-http-discovery-handler` project, navigate to `main.rs`. It contains all the logic to
+register our `DiscoveryHandler` with the Akri Agent. We only need to specify the `DiscoveryHandler` name and whether the device discovered by our `DiscoveryHandler` can be shared. Set `name` equal to `"http"` and `shared` to `true`, as our HTTP Discovery Handler will discover
+devices that can be shared between nodes. The protocol name also resolves to the name of the socket the Discovery
+Handler will run on.
 
-To create a new protocol type, a new struct and impl block is required.  To that end, create a new folder for our Nessie code: `agent/src/protocols/nessie` and add a reference this new module in `agent/src/protocols/mod.rs`:
-
-```rust
-mod debug_echo;
-mod nessie; // <--- Our new Nessie module
-mod onvif;
-```
-
-Next, add a few files to our new nessie folder:
-
-`agent/src/protocols/nessie/discovery_handler.rs`:
-```rust
-use super::super::{DiscoveryHandler, DiscoveryResult};
-use async_trait::async_trait;
-use failure::Error;
-use akri_shared::akri::configuration::NessieDiscoveryHandlerConfig;
-
-pub struct NessieDiscoveryHandler {
-    discovery_handler_config: NessieDiscoveryHandlerConfig,
-}
-
-impl NessieDiscoveryHandler {
-    pub fn new(
-        discovery_handler_config: &NessieDiscoveryHandlerConfig,
-    ) -> Self {
-        NessieDiscoveryHandler {
-            discovery_handler_config: discovery_handler_config.clone(),
-        }
-    }
-}
-
-#[async_trait]
-impl DiscoveryHandler for NessieDiscoveryHandler {
-    async fn discover(&self) -> Result<Vec<DiscoveryResult>, failure::Error> {
-        let results = Vec::new();
-        let url = self
-            .discovery_handler_config
-            .nessie_url
-            .parse::<hyper::Uri>()
-            .expect("failed to parse URL");
-        if let Ok(_body) = hyper::Client::new().get(url).compat().await {
-            // If the Nessie URL can be accessed, we will return a DiscoveryResult
-            // instance
-            let props = HashMap::new();
-            props.insert(
-                "nessie_url",
-                self.discovery_handler_config.nessie_url.clone(),
-            );
-            results.push(DiscoveryResult::new(
-                self.discovery_handler_config.nessie_url,
-                props,
-                true,
-            ));
-        }
-        Ok(results)
-    }
-    fn are_shared(&self) -> Result<bool, Error> {
-        Ok(true)
-    }
-}
-```
-
-`agent/src/protocols/nessie/mod.rs`:
-```rust
-mod discovery_handler;
-pub use self::discovery_handler::NessieDiscoveryHandler;
-```
-
-The next step is to update `inner_get_discovery_handler` in `agent/src/protocols/mod.rs` to create a NessieDiscoveryHandler:
-
-```rust
-match discovery_handler_config {
-    ProtocolHandler::nessie(nessie) => {
-        Ok(Box::new(nessie::NessieDiscoveryHandler::new(&nessie)))
-    }
-    ...
-```
-
-### Update Configuration CRD
-Now we need to update the Configuration CRD so that we can pass some properties to our new protocol handler.  First, lets create our data structures.
-
-The first step is to create a DiscoveryHandler configuration struct. This struct will be used to deserialize the CRD contents and will be passed on to our NessieDiscoveryHandler. Here we are specifying that users must pass in the url for where Nessie lives. This means that Agent is not doing any discovery work besides validating a URL, but this is the scenario we are using to simplify the example. Add this code to `shared/src/akri/configuration.rs`:
-
+### Decide what information is passed via an Akri Configuration
+Akri's Configuration CRD takes in a [`DiscoveryHandlerInfo`](../shared/src/akri/configuration.rs), which is defined
+structurally as follows:
 ```rust
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct NessieDiscoveryHandlerConfig {
-    nessie_url: String
+pub struct DiscoveryHandlerInfo {
+    pub name: String,
+    #[serde(default)]
+    pub discovery_details: String,
 }
 ```
+When creating a Discovery Handler, you must decide what name or label to give it and add any details you would like your
+Discovery Handler to receive in the `discovery_details` string. The Agent passes this string to Discovery Handlers as
+part of a `DiscoverRequest`. A discovery handler must then parse this string -- Akri's built in Discovery Handlers store
+an expected structure in it as serialized YAML -- to determine what to discover, filter out of discovery, and so on. In
+our case, no parsing is required, as it will simply put our discovery endpoint. Our implementation will ping the
+discovery service at that URL to see if there are any devices.
 
-Next, we need to update the Akri protocol handler enum to include Nessie:
-
-```rust
-pub enum ProtocolHandler {
-    nessie(NessieDiscoveryHandlerConfig),
-    ...
-}
-```
-
-Finally, we need to add Nessie to the CRD yaml so that Kubernetes can properly validate any one attempting to configure Akri to search for Nessie.  To do this, we need to modify `deployment/helm/crds/akri-configuration-crd.yaml`:
-
-```yaml
-openAPIV3Schema:
-    type: object
-    properties:
-    spec:
-        type: object
-        properties:
-        protocol: # {{ProtocolHandler}}
-            type: object
-            properties:
-            nessie: # {{NessieDiscoveryHandler}} <--- add this line
-                type: object                                # <--- add this line
-                properties:                                 # <--- add this line
-                nessieUrl:                                  # <--- add this line
-                    type: string                            # <--- add this line
-...
-```
-
-### Create a sample protocol broker
-The final step, is to create a protocol broker that will make Nessie available to the cluster.  The broker can be written in any language as it will be deployed as an individual pod; however, for this example, we will make a Rust broker. We can use cargo to create our project by navigating to `samples/brokers` and running `cargo new nessie`.
-
-As a simple strategy, we can split the broker implementation into parts:
-
-1. Create a shared buffer for the data
-1. Accessing the "nessie" data
-1. Exposing the "nessie" data to the cluster
-
-For the first step, we looked for a simple non-blocking, ring buffer ... we can add this to a module like `util` by creating `samples/brokers/nessie/src/util/mod.rs`:
-
-```rust
-pub mod nessie;
-pub mod nessie_service;
-
-use arraydeque::{ArrayDeque, Wrapping};
-// Create a wrapping (non-blocking) ring buffer with a capacity of 10 
-pub type FrameBuffer = ArrayDeque<[Vec<u8>; 10], Wrapping>;
-```
-
-To access the "nessie" data, we first need to retrieve any discovery information.  Any information stored in the DiscoveryResult properties map will be transferred into the broker container's environment variables.  Retrieving them is simply a matter of querying environment variables like this:
-
-```rust
-fn get_nessie_url() -> String {
-    nessie_url =
-        env::var("nessie_url").unwrap()
-}
-```
-
-For our Nessie broker, the "nessie" data can be generated with an http get.  In fact, the code we used in `discover` can be adapted for what we need:
-
-```rust
-async fn get_nessie(nessie_url: &String, frame_buffer: Arc<Mutex<FrameBuffer>>) {
-    let uri = nessie_url
-        .parse::<hyper::Uri>()
-        .expect("failed to parse URL");
-    if let Ok(response) = hyper::Client::new().get(uri).await {
-        let response_body = response
-            .into_body()
-            .try_fold(bytes::BytesMut::new(), |mut acc, chunk| async {
-                acc.extend(chunk);
-                Ok(acc)
-            })
-            .await
-            .unwrap()
-            .freeze();
-        frame_buffer
-            .lock()
-            .unwrap()
-            .push_back(response_body.to_vec());
-    }
-}
-```
-
-Finally, to expose data to the cluster, we suggest a simple gRPC service.  For a gRPC service, we need to do several things:
-
-1. Create a Nessie proto file describing our gRPC service
-1. Create a build file that a gRPC library like Tonic can use
-1. Leverage the output of our gRPC library build
-
-The first step is fairly simple for Nessie (create this in `samples/brokers/nessie/nessie.proto`):
-
-```proto
-syntax = "proto3";
-
-option csharp_namespace = "Nessie";
-
-package nessie;
-
-service Nessie {
-  rpc GetNessieNow (NotifyRequest) returns (NotifyResponse);
-}
-
-message NotifyRequest {
-}
-
-message NotifyResponse {
-  bytes frame = 1;
-}
-```
-
-The second step, assuming Tonic (though there are several very good gRPC libraries) is to create `samples/brokers/nessie/build.rs`:
-
-```rust
-fn main() {
-    tonic_build::configure()
-        .build_client(true)
-        .out_dir("./src/util")
-        .compile(&["./nessie.proto"], &["."])
-        .expect("failed to compile protos");
-}
-```
-
-Next, we need to include the gRPC generated code in by adding a reference to `nessie` in `samples/brokers/nessie/src/util/mod.rs`:
-
-```rust
-pub mod nessie;
-```
-
-With the gRPC implementation created, we can now start utilizing it.
-
-First, we need to leverage the generated gRPC code by creating `samples/brokers/nessie/src/util/nessie.rs`:
-
-```rust
-use super::{
-    nessie::{
-        nessie_server::{Nessie, NessieServer},
-        NotifyRequest, NotifyResponse,
-    },
-    FrameBuffer,
-};
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use tonic::{transport::Server, Request, Response};
-
-pub const NESSIE_SERVER_ADDRESS: &str = "0.0.0.0";
-pub const NESSIE_SERVER_PORT: &str = "8083";
-
-pub struct NessieService {
-    frame_rx: Arc<Mutex<FrameBuffer>>,
-}
-
-#[tonic::async_trait]
-impl Nessie for NessieService {
-    async fn get_nessie_now(
-        &self,
-        _request: Request<NotifyRequest>,
-    ) -> Result<Response<NotifyResponse>, tonic::Status> {
-        Ok(Response::new(NotifyResponse {
-            frame: match self.frame_rx.lock().unwrap().pop_front() {
-                Some(data) => data,
-                _ => vec![],
-            },
-        }))
-    }
-}
-
-pub async fn serve(frame_rx: Arc<Mutex<FrameBuffer>>) -> Result<(), String> {
-    let nessie = NessieService { frame_rx };
-    let service = NessieServer::new(nessie);
-
-    let addr_str = format!("{}:{}", NESSIE_SERVER_ADDRESS, NESSIE_SERVER_PORT);
-    let addr: SocketAddr = match addr_str.parse() {
-        Ok(sock) => sock,
-        Err(e) => {
-            return Err(format!("Unable to parse socket: {:?}", e));
-        }
-    };
-
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(service)
-            .serve(addr)
-            .await
-            .expect("couldn't build server");
-    });
-    Ok(())
-}
-```
-
-Once the gRPC code is utilized, we need to include our nessie server code by adding a reference to `nessie_service` in `samples/brokers/nessie/src/util/mod.rs`:
-
-```rust
-pub mod nessie_service;
-```
-
-
-Finally, we can tie all the pieces together in our main and retrieve the url from the Configuration in `samples/brokers/nessie/src/main.rs`:
-
-```rust
-mod util;
-
-use arraydeque::ArrayDeque;
-use futures_util::stream::TryStreamExt;
-use std::{
-    env,
-    sync::{Arc, Mutex},
-};
-use tokio::{time, time::Duration};
-use util::{nessie_service, FrameBuffer};
-
-fn get_nessie_url() -> String {
-    env::var("nessie_url").unwrap()
-}
-
-async fn get_nessie(nessie_url: &String, frame_buffer: Arc<Mutex<FrameBuffer>>) {
-    let uri = nessie_url
-        .parse::<hyper::Uri>()
-        .expect("failed to parse URL");
-    if let Ok(response) = hyper::Client::new().get(uri).await {
-        let response_body = response
-            .into_body()
-            .try_fold(bytes::BytesMut::new(), |mut acc, chunk| async {
-                acc.extend(chunk);
-                Ok(acc)
-            })
-            .await
-            .unwrap()
-            .freeze();
-        frame_buffer
-            .lock()
-            .unwrap()
-            .push_back(response_body.to_vec());
-    }
-}
-
-#[tokio::main]
-async fn main() {
-    let frame_buffer: Arc<Mutex<FrameBuffer>> = Arc::new(Mutex::new(ArrayDeque::new()));
-    let nessie_url = get_nessie_url();
-
-    nessie_service::serve(frame_buffer.clone()).await.unwrap();
-
-    let mut tasks = Vec::new();
-    tasks.push(tokio::spawn(async move {
-        loop {
-            time::delay_for(Duration::from_secs(10)).await;
-            get_nessie(&nessie_url, frame_buffer.clone()).await;
-        }
-    }));
-    futures::future::join_all(tasks).await;
-}
-```
-
-and ensure that we have the required dependencies in `samples/brokers/nessie/Cargo.toml`:
-
-```toml
-[dependencies]
-arraydeque = "0.4"
-bytes = "0.5"
-futures = "0.3"
-futures-util = "0.3"
-hyper = "0.13"
-prost = "0.6"
-akri-shared = { path = "../../../shared" }
-tokio = { version = "0.2", features = ["rt-threaded", "time", "stream", "fs", "macros", "uds"] }
-tonic = "0.1"
-tower = "0.3" 
-
-[build-dependencies]
-tonic-build = "0.1.1"
-```
-
-To build the Nessie container, we need to create a Dockerfile
-
-```dockerfile
-FROM amd64/rust:1.41 as build
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      g++ ca-certificates curl libssl-dev pkg-config
-
-WORKDIR /nessie
-RUN echo '[workspace]' > ./Cargo.toml && \
-    echo 'members = ["shared", "samples/brokers/nessie"]' >> ./Cargo.toml
-COPY ./samples/brokers/nessie ./samples/brokers/nessie
-COPY ./shared ./shared
-RUN cargo build
-
-FROM amd64/debian:buster-slim
-RUN apt-get update && apt-get install -y --no-install-recommends libssl-dev openssl && \
-      apt-get clean
-COPY --from=build ./target/debug/nessie /nessie
-
-# Expose port used by broker service
-EXPOSE 8083
-
-CMD ["./nessie"]
-```
-
-### Create a new Configuration
-Once the components have been created (and assuming the container, `nessie:latest`, is available on the worker nodes), the next question is how to deploy it.  For this, we need to create a Configuration called `nessie.yaml` that leverages our new protocol:
-
+Ultimately, the protocol section of our HTTP Configuration will look like the following.
 ```yaml
 apiVersion: akri.sh/v0
 kind: Configuration
 metadata:
-  name: nessie
+  name: http
 spec:
-  protocol:
-    nessie:
-      nessieUrl: https://www.lochness.co.uk/livecam/img/lochness.jpg
-  capacity: 5
-  brokerPodSpec:
-    containers:
-    - name: nessie-broker
-      image: "nessie:latest"
-      resources:
-        limits:
-          "{{PLACEHOLDER}}" : "1"
-  instanceServiceSpec:
-    ports:
-    - name: grpc
-      port: 80
-      targetPort: 8083
-  configurationServiceSpec:
-    ports:
-    - name: grpc
-      port: 80
-      targetPort: 8083
+  discoveryHandler:
+    name: http
+    discoveryDetails: http://discovery:9999/discovery
+```
+Now that we know what will be passed to our Discovery Handler, let's implement the discovery functionality.
+
+### Add discovery logic to the `DiscoveryHandler`
+A `DiscoveryHandler` Struct has been created (in `discovery_handler.rs`) that minimally implements the `Discover`
+service. Let's fill in the `discover` function, which returns the list of discovered devices. It should have all the
+functionality desired for discovering devices via your protocol and filtering for only the desired set. For the HTTP
+protocol, `discover` will perform an HTTP GET on the protocol's discovery service URL received in the `DiscoverRequest`.
+
+First, let's add the additional crates we are using to our `Cargo.toml` under dependencies.
+```toml
+anyhow = "1.0.38"
+reqwest = "0.10.8"
+```
+Now, import our dependencies and define some constants. Add the following after the other imports at the top of
+`discovery_handler.rs`.
+```rust
+use anyhow::Error;
+use reqwest::get;
+use std::collections::HashMap;
+
+const BROKER_NAME: &str = "AKRI_HTTP";
+const DEVICE_ENDPOINT: &str = "AKRI_HTTP_DEVICE_ENDPOINT";
 ```
 
-### Installing Akri with your new Configuration
-Before you can install Akri and apply your Nessie Configuration, you must first build both the Controller and Agent containers and push them to your own container repository. You can use any container registry to host your container repository.We are using the new [GitHub container registry](https://github.blog/2020-09-01-introducing-github-container-registry/). If you want to enable GHCR, you can follow the [getting started guide](https://docs.github.com/en/free-pro-team@latest/packages/getting-started-with-github-container-registry). 
+Fill in your `discover` function so as to match the following. Note, `discover` creates a streamed connection with the
+Agent, where the Agent gets the receiving end of the channel and the Discovery Handler sends device updates via the
+sending end of the channel. If the Agent drops its end, the Discovery Handler will stop discovery and attempt to
+re-register with the Agent. The Agent may drop its end due to an error or a deleted Configuration.
 
-We have provided makefiles for building and pushing containers for the various components of Akri. See the [development document](./development.md) for example make commands and details on how to install the prerequisites needed for cross-building Akri components. To specifically build the Controller and Agent for x64, run the following (after installing cross):
+```rust
+#[async_trait]
+impl Discovery for DiscoveryHandler {
+    type DiscoverStream = DiscoverStream;
+    async fn discover(
+        &self,
+        request: tonic::Request<DiscoverRequest>,
+    ) -> Result<Response<Self::DiscoverStream>, Status> {
+        // Get the discovery url from the `DiscoverRequest`
+        let url = request.get_ref().discovery_details;
+        // Create a channel for sending and receiving device updates
+        let (mut stream_sender, stream_receiver) = mpsc::channel(4);
+        let mut register_sender = self.register_sender.clone();
+        tokio::spawn(async move {
+            loop {
+                let resp = get(&url).await.unwrap(); 
+                // Response is a newline separated list of devices (host:port) or empty
+                let device_list = &resp.text().await.unwrap();
+                let devices = device_list
+                    .lines()
+                    .map(|endpoint| {
+                        let mut properties = HashMap::new();
+                        properties.insert(BROKER_NAME.to_string(), "http".to_string());
+                        properties.insert(DEVICE_ENDPOINT.to_string(), endpoint.to_string());
+                        Device {
+                            id: endpoint.to_string(),
+                            properties,
+                            mounts: Vec::default(),
+                            device_specs: Vec::default(),
+                        }
+                    })
+                    .collect::<Vec<Device>>();
+                // Send the Agent the list of devices.
+                if let Err(_) = stream_sender.send(Ok(DiscoverResponse { devices })).await {
+                    // Agent dropped its end of the stream. Stop discovering and signal to try to re-register.
+                    register_sender.send(()).await.unwrap();
+                    break;
+                }
+            }
+        });
+        // Send the agent one end of the channel to receive device updates
+        Ok(Response::new(stream_receiver))
+    }
+}
 ```
-PREFIX=ghcr.io/<your-github-alias> BUILD_AMD64=1 BUILD_ARM32=0 BUILD_ARM64=0 make akri-agent
-PREFIX=ghcr.io/<your-github-alias> BUILD_AMD64=1 BUILD_ARM32=0 BUILD_ARM64=0 make akri-controller
-```
-Next, you must [generate a new Akri chart](./development#helm-template). You can now [install Akri with the newly built containers](./development#install-akri-with-newly-built-containers), setting the appropriate image address for the Agent and Controller pods in your personal container registry. 
+### Build the DiscoveryHandler container
+Now you are ready to build your HTTP discovery handler and push it to your container registry. To do so, we simply need
+to run this step from the base folder of the Akri repo:
 
-Finally, you can apply your Nessie Configuration and watch as broker pods are created:
-```sh
-kubectl apply -f nessie.yaml
-watch kubectl get pods
+```bash
+HOST="ghcr.io"
+USER=[[GITHUB-USER]]
+DH="http-discovery-handler"
+TAGS="v1"
+
+DH_IMAGE="${HOST}/${USER}/${DH}"
+DH_IMAGE_TAGGED="${DH_IMAGE}:${TAGS}"
+
+docker build \
+--tag=${DH_IMAGE_TAGGED} \
+--file=./Dockerfile.discovery-handler \
+. && \
+docker push ${DH_IMAGE_TAGGED}
+```
+
+Save the name of your image. We will pass it into our Akri installation command when we are ready to deploy our
+discovery handler.
+
+## Create some HTTP devices
+At this point, we've extended Akri to include discovery for our HTTP protocol and we've created an HTTP broker that can
+be deployed.  To really test our new discovery and brokers, we need to create something to discover.
+
+For this exercise, we can create an HTTP service that listens to various paths.  Each path can simulate a different
+device by publishing some value.  With this, we can create a single Kubernetes pod that can simulate multiple devices.
+To make our scenario more realistic, we can add a discovery endpoint as well.  Further, we can create a series of
+Kubernetes services that create facades for the various paths, giving the illusion of multiple devices and a separate
+discovery service.
+
+To that end, let's:
+
+1. Create a web service that mocks HTTP devices and a discovery service
+1. Deploy, start, and expose our mock HTTP devices and discovery service
+
+### Mock HTTP devices and Discovery service
+To simulate a set of discoverable HTTP devices and a discovery service, create a simple HTTP server
+(`samples/apps/http-apps/cmd/device/main.go`).  The application will accept a list of `path` arguments, which will
+define endpoints that the service will respond to.  These endpoints represent devices in our HTTP protocol.  The
+application will also accept a set of `device` arguments, which will define the set of discovered devices.
+
+```go
+package main
+
+import (
+  "flag"
+  "fmt"
+  "log"
+  "math/rand"
+  "net"
+  "net/http"
+  "time"
+  "strings"
+)
+
+const (
+  addr = ":8080"
+)
+
+// RepeatableFlag is an alias to use repeated flags with flag
+type RepeatableFlag []string
+
+// String is a method required by flag.Value interface
+func (e *RepeatableFlag) String() string {
+  result := strings.Join(*e, "\n")
+  return result
+}
+
+// Set is a method required by flag.Value interface
+func (e *RepeatableFlag) Set(value string) error {
+  *e = append(*e, value)
+  return nil
+}
+var _ flag.Value = (*RepeatableFlag)(nil)
+var paths RepeatableFlag
+var devices RepeatableFlag
+
+func main() {
+  flag.Var(&paths, "path", "Repeat this flag to add paths for the device")
+  flag.Var(&devices, "device", "Repeat this flag to add devices to the discovery service")
+  flag.Parse()
+
+  // At a minimum, respond on `/`
+  if len(paths) == 0 {
+    paths = []string{"/"}
+  }
+  log.Printf("[main] Paths: %d", len(paths))
+
+  seed := rand.NewSource(time.Now().UnixNano())
+  entr := rand.New(seed)
+
+  handler := http.NewServeMux()
+
+  // Create handler for the discovery endpoint
+  handler.HandleFunc("/discovery", func(w http.ResponseWriter, r *http.Request) {
+    log.Printf("[discovery] Handler entered")
+    fmt.Fprintf(w, "%s\n", html.EscapeString(devices.String()))
+  })
+  // Create handler for each endpoint
+  for _, path := range paths {
+    log.Printf("[main] Creating handler: %s", path)
+    handler.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+      log.Printf("[device] Handler entered: %s", path)
+      fmt.Fprint(w, entr.Float64())
+    })
+  }
+
+  s := &http.Server{
+    Addr:    addr,
+    Handler: handler,
+  }
+  listen, err := net.Listen("tcp", addr)
+  if err != nil {
+    log.Fatal(err)
+  }
+
+  log.Printf("[main] Starting Device: [%s]", addr)
+  log.Fatal(s.Serve(listen))
+}
+```
+
+To ensure that our GoLang project builds, we need to create `samples/apps/http-apps/go.mod`:
+
+```
+module github.com/deislabs/akri/http-extensibility
+
+go 1.15
+```
+
+### Build and Deploy devices and discovery
+To build and deploy the mock devices and discovery, a simple Dockerfile can be created that builds and exposes our mock
+server `samples/apps/http-apps/Dockerfiles/device`:
+```dockerfile
+FROM golang:1.15 as build
+WORKDIR /http-extensibility
+COPY go.mod .
+RUN go mod download
+COPY . .
+RUN GOOS=linux \
+    go build -a -installsuffix cgo \
+    -o /bin/device \
+    github.com/deislabs/akri/http-extensibility/cmd/device
+FROM gcr.io/distroless/base-debian10
+COPY --from=build /bin/device /
+USER 999
+EXPOSE 8080
+ENTRYPOINT ["/device"]
+CMD ["--path=/","--path=/sensor","--device=device:8000","--device=device:8001"]
+```
+
+And to deploy, use `docker build` and `docker push`:
+```bash
+cd ./samples/apps/http-apps
+
+HOST="ghcr.io"
+USER=[[GITHUB-USER]]
+PREFIX="http-apps"
+TAGS="v1"
+IMAGE="${HOST}/${USER}/${PREFIX}-device:${TAGS}"
+
+docker build \
+  --tag=${IMAGE} \
+  --file=./Dockerfiles/device \
+  .
+docker push ${IMAGE}
+```
+
+The mock devices can be deployed with a Kubernetes deployment `samples/apps/http-apps/kubernetes/device.yaml` (update
+**image** based on the ${IMAGE}):
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: device
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      id: akri-http-device
+  template:
+    metadata:
+      labels:
+        id: akri-http-device
+      name: device
+    spec:
+      imagePullSecrets:
+        - name: crPullSecret
+      containers:
+        - name: device
+          image: IMAGE
+          imagePullPolicy: Always
+          args:
+            - --path=/
+            - --device=http://device-1:8080
+            - --device=http://device-2:8080
+            - --device=http://device-3:8080
+            - --device=http://device-4:8080
+            - --device=http://device-5:8080
+            - --device=http://device-6:8080
+            - --device=http://device-7:8080
+            - --device=http://device-8:8080
+            - --device=http://device-9:8080
+          ports:
+            - name: http
+              containerPort: 8080
+```
+
+Then apply `device.yaml` to create a deployment (called `device`) and a pod (called `device-...`):
+
+```bash
+kubectl apply --filename=./samples/apps/http-apps/kubernetes/device.yaml
+```
+
+> **NOTE** We're using one deployment|pod to represent 9 devices AND a discovery service ... we will create 9 (distinct)
+> Services against it (1 for each mock device) and 1 Service to present the discovery service.
+
+Then create 9 mock device Services:
+
+```bash
+for NUM in {1..9}
+do
+  # Services are uniquely named
+  # The service uses the Pods port: 8080
+  kubectl expose deployment/device \
+  --name=device-${NUM} \
+  --port=8080 \
+  --target-port=8080 \
+  --labels=id=akri-http-device
+done
+```
+
+> Optional: check one the services:
+>
+> ```bash
+> kubectl run curl -it --rm --image=curlimages/curl -- sh
+> ```
+>
+> Then, pick a value for `X` between 1 and 9:
+>
+> ```bash
+> X=6
+> curl device-${X}:8080
+> ```
+>
+> Any or all of these should return a (random) 'sensor' value.
+
+Then create a Service (called `discovery`) using the deployment:
+
+```bash
+kubectl expose deployment/device \
+--name=discovery \
+--port=8080 \
+--target-port=8080 \
+--labels=id=akri-http-device
+```
+
+> Optional: check the service to confirm that it reports a list of devices correctly using:
+>
+> ```bash
+> kubectl run curl -it --rm --image=curlimages/curl -- sh
+> ```
+>
+> Then, curl the service's endpoint:
+>
+> ```bash
+> curl discovery:8080/discovery
+> ```
+>
+> This should return a list of 9 devices, of the form `http://device-X:8080`
+
+## Deploy Akri
+Now that we have created a HTTP Discovery Handler and created some mock devices, let's deploy Akri and see how it
+discovers the devices and creates Akri Instances for each Device.
+
+> Optional: If you've previous installed Akri and wish to reset, you may:
+>
+> ```bash
+> # Delete Akri Helm
+> sudo helm delete akri
+> ```
+
+Akri has provided helm templates for custom Discovery Handlers and their Configurations. These templates are provided as
+a starting point. They may need to modified to meet the needs of a Discovery Handler. When installing Akri, specify that
+you want to deploy a custom Discovery Handler as a Daemonset by setting `customDiscovery.discovery.enabled=true`.
+Specify the container for that DaemonSet as the HTTP discovery handler that you built
+[above](###build-the-discoveryhandler-container) by setting `customDiscovery.discovery.image.repository=$DH_IMAGE` and `customDiscovery.discovery.image.repository=$TAGS`. To
+automatically deploy a custom Configuration, set `customDiscovery.enabled=true`. We will customize this Configuration to
+contain the discovery endpoint needed by our HTTP Discovery Handler by setting it in the `discovery_details` string of
+the Configuration, like so: `customDiscovery.discoveryDetails=http://discovery:9999/discovery`. We also need to set the
+protocol name the Discovery Handler will register under (`customDiscovery.discoveryHandlerName`) and a name for the
+Discovery Handler and Configuration (`customDiscovery.name`). All these settings come together as the following Akri
+installation command:
+> Note: Be sure to consult the [user guide](./user-guide.md) to see whether your Kubernetes distribution needs any
+> additional configuration.
+```bash
+  helm repo add akri-helm-charts https://deislabs.github.io/akri/
+  helm install akri akri-helm-charts/akri-dev \
+  --set imagePullSecrets[0].name="crPullSecret" \
+  --set customDiscovery.discovery.enabled=true  \
+  --set customDiscovery.discovery.image.repository=$DH_IMAGE \
+  --set customDiscovery.discovery.image.tag=$TAGS \
+  --set customDiscovery.enabled=true  \
+  --set customDiscovery.name=akri-http  \
+  --set customDiscovery.discoveryHandlerName=http \
+  --set customDiscovery.discoveryDetails=http://discovery:9999/discovery
+  ```
+
+Watch as the Agent, Controller, and Discovery Handler Pods are spun up and as Instances are created for each of the
+discovery devices. `watch kubectl get pods,akrii`
+
+If you simply wanted Akri to expose discovered devices to the cluster as Kubernetes resources, you could stop here. If
+you have a workload that could utilize one of these resources, you could [manually deploy pods that request them as
+resources](./requesting-akri-resources.md). Alternatively, you could have Akri automatically deploy workloads to
+discovered devices. We call these workloads brokers. To quickly see this, lets deploy empty nginx pods to discovered
+resources, by updating our Configuration to include a broker PodSpec.
+```bash
+  helm upgrade akri akri-helm-charts/akri-dev \
+    --set imagePullSecrets[0].name="crPullSecret" \
+    --set customDiscovery.discovery.enabled=true  \
+    --set customDiscovery.discovery.image.repository=$DH_IMAGE \
+    --set customDiscovery.discovery.image.tag=$TAGS \
+    --set customDiscovery.enabled=true  \
+    --set customDiscovery.name=akri-http  \
+    --set customDiscovery.discoveryHandlerName=http \
+    --set customDiscovery.discoveryDetails=http://discovery:9999/discovery \
+    --set customDiscovery.brokerPod.image.repository=nginx
+  watch kubectl get pods,akrii
+```
+Our empty nginx brokers do not do anything with the devices they've requested, so lets create our own broker.
+
+## Create a sample protocol broker
+We have successfully created our Discovery Handler. If you want Akri to also automatically deploy Pods (called brokers)
+to each discovered device, this section will show you how to create a custom broker that will make the HTTP-based Device
+data available to the cluster.  The broker can be written in any language as it will be deployed as an individual pod.
+
+3 different broker implementations have been created for the HTTP protocol in the [http-extensibility
+branch](https://github.com/deislabs/akri/tree/http-extensibility), 2 in Rust and 1 in Go:
+* The standalone broker is a self-contained scenario that demonstrates the ability to interact with HTTP-based devices
+  by `curl`ing a device's endpoints. This type of solution would be applicable in batch-like scenarios where the broker
+  performs a predictable set of processing steps for a device.
+* The second scenario uses gRPC. gRPC is an increasingly common alternative to REST-like APIs and supports
+  high-throughput and streaming methods. gRPC is not a requirement for broker implementations in Akri but is used here
+  as one of many mechanisms that may be used. The gRPC-based broker has a companion client. This is a more realistic
+  scenario in which the broker proxies client requests using gRPC to HTTP-based devices. The advantage of this approach
+  is that device functionality is encapsulated by an API that is exposed by the broker. In this case the API has a
+  single method but in practice, there could be many methods implemented.
+* The third implemnentation is a gRPC-based broker and companion client implemented in Golang. This is functionally
+  equivalent to the Rust implementation and shares a protobuf definition. For this reason, you may combine the Rust
+  broker and client with the Golang broker and client arbitrarily. The Golang broker is described in the
+  [`http-apps`](https://github.com/deislabs/akri/blob/http-extensibility/samples/apps/http-apps/README.md) directory.
+
+For this, we will describe the first option, a standalone broker.  For a more detailed look at the other gRPC options,
+please look at [extensibility-http-grpc.md in the http-extensibility
+branch](https://github.com/deislabs/akri/blob/http-extensibility/docs/extensibility-http-grpc.md).
+
+First, let's create a new Rust project for our sample broker.  We can use cargo to create our project by navigating to
+`samples/brokers` and running:
+
+```bash
+cargo new http
+```
+
+Once the http project has been created, it can be added to the greater Akri project by adding `"samples/brokers/http"`
+to the **members** in `./Cargo.toml`.
+
+To access the HTTP-based Device data, we first need to retrieve the discovery information.  Any information stored in
+the `Device` properties map will be transferred into the broker container's environment variables.  Retrieving them is
+simply a matter of querying environment variables like this:
+
+```rust
+let device_url = env::var("AKRI_HTTP_DEVICE_ENDPOINT")?;
+```
+
+For our HTTP broker, the data can be retrieved with a simple GET:
+
+```rust
+async fn read_sensor(device_url: &str) {
+    match get(device_url).await {
+        Ok(resp) => {
+            let body = resp.text().await;
+        }
+        Err(err) => println!("Error: {:?}", err),
+    };
+}
+```
+
+We can tie all the pieces together in `samples/brokers/http/src/main.rs`.  We retrieve the HTTP-based Device url from
+the environment variables, make a simple GET request to retrieve the device data, and output the response to the log:
+
+```rust
+use reqwest::get;
+use std::env;
+use tokio::{time, time::Duration};
+
+const DEVICE_ENDPOINT: &str = "AKRI_HTTP_DEVICE_ENDPOINT";
+
+async fn read_sensor(device_url: &str) {
+    match get(device_url).await {
+        Ok(resp) => {
+            let body = resp.text().await;
+            println!("[main:read_sensor] Response body: {:?}", body);
+        }
+        Err(err) => println!("Error: {:?}", err),
+    };
+}
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let device_url = env::var(DEVICE_ENDPOINT)?;
+    let mut tasks = Vec::new();
+    tasks.push(tokio::spawn(async move {
+        loop {
+            time::delay_for(Duration::from_secs(10)).await;
+            read_sensor(&device_url[..]).await;
+        }
+    }));
+    futures::future::join_all(tasks).await;
+    Ok(())
+}
+```
+
+and ensure that we have the required dependencies in `samples/brokers/http/Cargo.toml`:
+
+```toml
+[[bin]]
+name = "standalone"
+path = "src/main.rs"
+
+[dependencies]
+futures = "0.3"
+reqwest = "0.10.8"
+tokio = { version = "0.2", features = ["rt-threaded", "time", "stream", "fs", "macros", "uds"] }
+```
+
+To build the HTTP broker, we need to create a Dockerfile, `samples/brokers/http/Dockerfiles/standalone`:
+
+```dockerfile
+FROM amd64/rust:1.47 as build
+RUN rustup component add rustfmt --toolchain 1.47.0-x86_64-unknown-linux-gnu
+RUN USER=root cargo new --bin http
+WORKDIR /http
+
+COPY ./samples/brokers/http/Cargo.toml ./Cargo.toml
+RUN cargo build \
+    --bin=standalone \
+    --release
+RUN rm ./src/*.rs
+RUN rm ./target/release/deps/standalone*
+COPY ./samples/brokers/http .
+RUN cargo build \
+    --bin=standalone \
+    --release
+
+FROM amd64/debian:buster-slim
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl-dev \
+    openssl && \
+    apt-get clean
+
+COPY --from=build /http/target/release/standalone /standalone
+LABEL org.opencontainers.image.source https://github.com/deislabs/akri
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV SSL_CERT_DIR=/etc/ssl/certs
+ENV RUST_LOG standalone
+
+ENTRYPOINT ["/standalone"]
+```
+
+Akri's `.dockerignore` is configured so that docker will ignore most files in our repository, some exceptions will need
+to be added to build the HTTP broker:
+
+```console
+!samples/brokers/http
+```
+
+Now you are ready to **build the HTTP broker**!  To do so, we simply need to run this step from the base folder of the
+Akri repo:
+
+```bash
+HOST="ghcr.io"
+USER=[[GITHUB-USER]]
+BROKER="http-broker"
+TAGS="v1"
+
+BROKER_IMAGE="${HOST}/${USER}/${BROKER}"
+BROKER_IMAGE_TAGGED="${BROKER_IMAGE}:${TAGS}"
+
+docker build \
+--tag=${BROKER_IMAGE_TAGGED} \
+--file=./samples/brokers/http/Dockerfiles/standalone \
+. && \
+docker push ${BROKER_IMAGE_TAGGED}
+```
+
+## Deploy broker
+
+Now that the HTTP broker has been created, we can substitute it's image in for the simple nginx broker we previously
+used in our installation command.
+```bash
+  helm upgrade akri akri-helm-charts/akri-dev \
+    --set imagePullSecrets[0].name="crPullSecret" \
+    --set customDiscovery.discovery.enabled=true  \
+    --set customDiscovery.discovery.image.repository=$DH_IMAGE \
+    --set customDiscovery.discovery.image.tag=$TAGS \
+    --set customDiscovery.enabled=true  \
+    --set customDiscovery.name=akri-http  \
+    --set customDiscovery.discoveryHandlerName=http \
+    --set customDiscovery.discoveryDetails=http://discovery:9999/discovery \
+    --set customDiscovery.brokerPod.image.repository=$BROKER_IMAGE \
+    --set customDiscovery.brokerPod.image.tag=$TAGS
+  watch kubectl get pods,akrii
+```
+> Note: substitute `helm upgrade` for `helm install` if you do not have an existing Akri installation
+
+We can watch as the broker pods get deployed: 
+```bash
+watch kubectl get pods -o wide
 ```
 
 ## Contributing your Protocol Implementation back to Akri
-Now that you have a working protocol implementation and broker, we'd love for you to contribute your code to Akri. The following steps will need to be completed to do so:
+Now that you have a working protocol implementation and broker, we'd love for you to contribute your code to Akri. The
+following steps will need to be completed to do so:
 1. Create an Issue with a feature request for this protocol.
 2. Create a proposal and put in PR for it to be added to the [proposals folder](./proposals).
 3. Implement your protocol and provide a full end to end sample.
-4. Create a pull request, updating the minor version of akri. See [contributing](./contributing.md#versioning) to learn more about our versioning strategy.
+4. Create a pull request, that includes discovery handler and Dockerfile in the [discovery handler
+   modules](../discovery-handler-modules) and [build](../build/containers/discovery-handlers) directories, respectively.
+   Be sure to also update the minor version of Akri. See [contributing](./contributing.md#versioning) to learn more
+   about our versioning strategy.
 
-For a protocol to be considered fully implemented the following must be included in the PR. Note how the Nessie protocol above only has completed the first 3 requirements. 
-1. A new DiscoveryHandler implementation in the Akri Agent
-1. An update to the Configuration CRD to include the new `ProtocolHandler`
+For a protocol to be considered fully implemented the following must be included in the PR. Note that the HTTP protocol
+above has not completed all of the requirements. 
+1. A new DiscoveryHandler implementation 
 1. A sample protocol broker for the new resource
 1. A sample Configuration that uses the new protocol in the form of a Helm template and values
 1. (Optional) A sample end application that utilizes the services exposed by the Configuration
 1. Dockerfile[s] for broker [and sample app] and associated update to the [makefile](../build/akri-containers.mk)
 1. Github workflow[s] for broker [and sample app] to build containers and push to Akri container repository
-1. Documentation on how to use the new sample Configuration, like the [ONVIF Sample document](./onvif-sample.md)
+1. Documentation on how to use the new sample Configuration, like the [udev Configuration
+   document](./udev-configuration.md)

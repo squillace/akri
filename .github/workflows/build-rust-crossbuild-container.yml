@@ -33,11 +33,13 @@ jobs:
       matrix:
         arch:
           - arm64v8
-          # - arm32v7
+          - arm32v7
           - amd64
     steps:
-    - name: Checkout repo
+    - name: Checkout the head commit of the branch
       uses: actions/checkout@v2
+      with:
+        persist-credentials: false
 
     - name: Akri intermediate builds are LONG running and should only be run when absolutely needed
       if: >-
@@ -51,7 +53,7 @@ jobs:
 
     # Only run build version change check if PR title and Merge commit message do NOT contain "[SAME VERSION]"
     - if: >-
-        github.event_name == 'pull_request' &&
+        startsWith(github.event_name, 'pull_request') &&
         !contains(github.event.pull_request.title, '[SAME VERSION]') &&
         !contains(github.event.commits[0].message, '[SAME VERSION]')
       name: Ensure that ${{ env.AKRI_COMPONENT }} version has changed

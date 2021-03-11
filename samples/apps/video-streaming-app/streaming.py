@@ -16,122 +16,225 @@ import traceback
 
 from flask import Flask, render_template, Response
 
-camera_frame_queues = []
+from kubernetes import client, config
+import re
 
-main_frame_source = ""
-small_frame_sources = []
+class CameraFeed:
+    def __init__(self, url):
+        global global_stop_event
 
-if 'CONFIGURATION_NAME' in os.environ:
-    configuration_name = os.environ['CONFIGURATION_NAME']
-    short_env_var_prefix = (configuration_name + '-').upper().replace('-', '_')
-    # For every k8s service, an env var is set in every node with its ports.  The
-    # format is <SERVICE_NAME_IN_CAPS>_SERVICE_PORT_<PORT_NAME>.  Here, we will query
-    # these values on the streaming app node, to get the exposed port number ... but
-    # we will assume that the ports are named 'grpc', if the name changes, THIS CODE
-    # WILL BREAK.
-    env_var_prefix = short_env_var_prefix + 'SVC_SERVICE_'
-    grpc_port = os.environ[env_var_prefix + 'PORT_GRPC'] # instance services are using the same port by default
-    main_frame_source = "{0}:{1}".format(os.environ[env_var_prefix + 'HOST'], grpc_port)
-    instance_service_hosts = filter(
-        lambda name: name.startswith(short_env_var_prefix) and not name.startswith(env_var_prefix) and name.endswith('_SERVICE_HOST'),
-        os.environ)
-    camera_count = 0
-    for svc_host_env_var in instance_service_hosts:
-        url = "{0}:{1}".format(os.environ[svc_host_env_var], grpc_port)
-        small_frame_sources.append(url)
-        camera_count += 1
+        self.url = url
+        self.queue = queue.Queue(1)
+        self.thread = None
+        self.stop_event = global_stop_event
 
-else:
-    camera_count = int(os.environ['CAMERA_COUNT'])
-    main_frame_source = "{0}:80".format(os.environ['CAMERAS_SOURCE_SVC'])
-    for camera_id in range(1, camera_count + 1):
-        url = "{0}:80".format(os.environ['CAMERA{0}_SOURCE_SVC'.format(camera_id)])
-        small_frame_sources.append(url)
+    def __eq__(self, other):
+        if other is None:
+            return False
+        return self.url == other.url
 
-for camera_id in range(camera_count + 1):
-    camera_frame_queues.append(queue.Queue(1))
+    def start_handler(self):
+        self.thread = threading.Thread(target=self.get_frames)
+        self.thread.start()
 
-app = Flask(__name__)
+    def wait_handler(self):
+        if self.thread is not None:
+            self.thread.join()
 
-@app.route('/')
-# Home page for video streaming.
-def index():
-    return render_template('index.html', camera_count = camera_count)
+    # Generator function for video streaming.
+    def generator_func(self):
+        while not self.stop_event.wait(0.01):
+            frame = self.queue.get(True, None)
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
-# Generator function for video streaming.
-def gen(frame_queue, verbose=False):
-    while True:
-        frame = frame_queue.get(True, None)
-        if (verbose):
-            logging.info("Sending frame %d" % len(frame))
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+    # Loops, creating gRPC client and grabing frame from camera serving specified url.
+    def get_frames(self):
+        logging.info("Starting get_frames(%s)" % self.url)
+        while not self.stop_event.wait(0.01):
+            try:
+                client_channel = grpc.insecure_channel(self.url, options=(
+                    ('grpc.use_local_subchannel_pool', 1),))
+                camera_stub = camera_pb2_grpc.CameraStub(client_channel)
+                frame = camera_stub.GetFrame(camera_pb2.NotifyRequest())
+                frame = frame.frame
+                client_channel.close()
 
-# Gets response and puts it in frame queue.
-def response_wrapper(frame_queue):
-    return Response(gen(frame_queue),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+                frame_received = False
+                # prevent stale data
+                if (len(frame) > 0):
+                    if (self.queue.full()):
+                        try:
+                            self.queue.get(False)
+                        except:
+                            pass
+                    self.queue.put(frame, False)
+                    frame_received = True
+                
+                if (frame_received):
+                    sleep(1)
 
-@app.route('/camera_frame_feed/<camera_id>')
-# Gets frame feed for specified camera.
-def camera_frame_feed(camera_id=0):
-    camera_id = int(camera_id)
-    if (camera_id <= camera_count):
-        return response_wrapper(camera_frame_queues[camera_id])
-    return None
+            except:
+                logging.info("[%s] Exception %s" % (self.url, traceback.format_exc()))
+                sleep(1)
+
+class CameraDisplay:
+    def __init__(self):
+        self.main_camera = None
+        self.small_cameras = []
+        self.mutex = threading.Lock()
+
+    def __eq__(self, other):
+        return self.main_camera == other.main_camera and self.small_cameras == other.small_cameras
+        
+    def start_handlers(self):
+        if self.main_camera is not None:
+            self.main_camera.start_handler()
+        for small_camera in self.small_cameras:
+            small_camera.start_handler()
+
+    def wait_handlers(self):
+        global global_stop_event
+
+        global_stop_event.set()
+        if self.main_camera is not None:
+            self.main_camera.wait_handler()
+        for small_camera in self.small_cameras:
+            small_camera.wait_handler()
+        global_stop_event.clear()
+        
+    def merge(self, other):
+        self.mutex.acquire()
+        try:
+            self.wait_handlers()
+
+            self.main_camera = other.main_camera
+            self.small_cameras = other.small_cameras
+
+            self.start_handlers()
+        finally:
+            self.mutex.release()
+
+    def count(self):
+        self.mutex.acquire()    
+        result = len(self.small_cameras)
+        if self.main_camera is not None:
+            result += 1
+        self.mutex.release()
+        return result
+
+    def hash_code(self):
+        self.mutex.acquire()
+        cameras = ",".join([camera.url for camera in self.small_cameras])
+        if self.main_camera is not None:
+            cameras = "{0}+{1}".format(self.main_camera.url, cameras)
+        self.mutex.release()
+        return cameras
+
+    def stream_frames(self, camera_id):
+        selected_camera = None
+        camera_id = int(camera_id)
+
+        self.mutex.acquire()
+        if camera_id == 0:
+            selected_camera = self.main_camera
+        elif camera_id - 1 < len(self.small_cameras):
+            selected_camera = self.small_cameras[camera_id - 1]
+        self.mutex.release()
+        
+        if selected_camera is None:
+            return Response(None, 500)
+        else:
+            return Response(selected_camera.generator_func(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+def get_camera_display(configuration_name):
+    camera_display = CameraDisplay()
+    
+    config.load_incluster_config()
+    coreV1Api = client.CoreV1Api()
+
+    # TODO use labels instead once available
+    instance_service_name_regex = re.compile(
+        configuration_name + "-[\da-f]{6}-svc")
+
+    ret = coreV1Api.list_service_for_all_namespaces(watch=False)
+    for svc in ret.items:
+        if svc.metadata.name == configuration_name + "-svc":
+            grpc_ports = list(
+                filter(lambda port: port.name == "grpc", svc.spec.ports))
+            if (len(grpc_ports) == 1):
+                url = "{0}:{1}".format(svc.spec.cluster_ip, grpc_ports[0].port)
+                camera_display.main_camera = CameraFeed(url)
+        elif instance_service_name_regex.match(svc.metadata.name):
+            grpc_ports = list(
+                filter(lambda port: port.name == "grpc", svc.spec.ports))
+            if (len(grpc_ports) == 1):
+                url = "{0}:{1}".format(svc.spec.cluster_ip, grpc_ports[0].port)
+                camera_display.small_cameras.append(CameraFeed(url))
+
+    camera_display.small_cameras.sort(key=lambda camera: camera.url)
+
+    return camera_display
 
 def run_webserver():
     app.run(host='0.0.0.0', threaded=True)
 
-# Loops, creating gRPC client and grabing frame from camera serving specified url.
-def get_frames(url, frame_queue):
-    logging.info("Starting get_frames(%s)" % url)
+def refresh_cameras():
+    global global_camera_display
     while True:
-        try:
-            client_channel = grpc.insecure_channel(url, options=(
-                ('grpc.use_local_subchannel_pool', 1),))
-            camera_stub = camera_pb2_grpc.CameraStub(client_channel)
-            frame = camera_stub.GetFrame(camera_pb2.NotifyRequest())
-            frame = frame.frame
-            client_channel.close()
+        sleep(1)
+        camera_display = get_camera_display(os.environ['CONFIGURATION_NAME'])
+        if camera_display != global_camera_display:
+            global_camera_display.merge(camera_display)
 
-            frame_received = False
-            # prevent stale data
-            if (len(frame) > 0):
-                if (frame_queue.full()):
-                    try:
-                        frame_queue.get(False)
-                    except:
-                        pass
-                frame_queue.put(frame, False)
-                frame_received = True
-            
-            if (frame_received):
-                sleep(1)
+global_stop_event = threading.Event()
+global_camera_display = CameraDisplay()
 
-        except:
-            logging.info("[%s] Exception %s" % (url, traceback.format_exc()))
-            sleep(1)
+app = Flask(__name__)
+
+# Home page for video streaming.
+@app.route('/')
+def index():
+    global global_camera_display
+    return render_template('index.html', camera_count=global_camera_display.count(), camera_list=global_camera_display.hash_code())
+
+# Returns the current list of cameras to allow for refresh
+@app.route('/camera_list')
+def camera_list():
+    global global_camera_display
+    logging.info("Expected cameras: %s" % global_camera_display.hash_code())
+    return global_camera_display.hash_code()
+
+# Gets frame feed for specified camera.
+@app.route('/camera_frame_feed/<camera_id>')
+def camera_frame_feed(camera_id=0):
+    global global_camera_display
+    return global_camera_display.stream_frames(camera_id)
 
 print("Starting...", flush=True)
+logging.basicConfig(format="%(asctime)s: %(message)s", level=logging.INFO, datefmt="%H:%M:%S")
 
-format = "%(asctime)s: %(message)s"
-logging.basicConfig(format=format, level=logging.INFO, datefmt="%H:%M:%S")
+if 'CONFIGURATION_NAME' in os.environ:
+    # Expecting source service ports to be named grpc
+
+    configuration_name = os.environ['CONFIGURATION_NAME']
+    camera_display = get_camera_display(configuration_name)
+    global_camera_display.merge(camera_display)
+
+    refresh_thread = threading.Thread(target=refresh_cameras)
+    refresh_thread.start()
+else:
+    camera_count = int(os.environ['CAMERA_COUNT'])
+    main_camera_url = "{0}:80".format(os.environ['CAMERAS_SOURCE_SVC'])
+    global_camera_display.main_camera = CameraFeed(main_camera_url)
+    for camera_id in range(1, camera_count + 1):
+        url = "{0}:80".format(
+            os.environ['CAMERA{0}_SOURCE_SVC'.format(camera_id)])
+        global_camera_display.small_cameras.append(CameraFeed(url))
+    global_camera_display.start_handlers()
 
 webserver_thread = threading.Thread(target=run_webserver)
 webserver_thread.start()
 
-cameras_frame_thread = threading.Thread(target=get_frames, args=(main_frame_source, camera_frame_queues[0]))
-cameras_frame_thread.start()
-camera_frame_threads = [cameras_frame_thread]
-
-for camera_id in range(1, camera_count + 1):
-    camera_frame_thread = threading.Thread(target=get_frames, args=(small_frame_sources[camera_id - 1], camera_frame_queues[camera_id]))
-    camera_frame_thread.start()
-    camera_frame_threads.append(camera_frame_thread)
-
 print("Started", flush=True)
 webserver_thread.join()
-for camera_frame_thread in camera_frame_threads:
-    camera_frame_thread.join()
 print("Done", flush=True)

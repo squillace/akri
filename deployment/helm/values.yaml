@@ -16,6 +16,26 @@ useDevelopmentContainers: true
 # This can be set from the helm command line using `--set imagePullSecrets[0].name="mysecret"`
 imagePullSecrets: []
 
+# generalize references to `apiGroups` and `apiVersion` values for Akri CRDs
+crds:
+  group: akri.sh
+  version: v0
+
+rbac:
+  # enabled defines whether to apply rbac to Akri
+  enabled: true
+
+prometheus:
+  # enabled defines whether metrics ports are exposed on
+  # the Controller and Agent
+  enabled: false
+  # endpoint is the path the port exposed for metrics
+  endpoint: /metrics
+  # port is the port that the metrics service is exposed on
+  port: 8080
+  # portName is the name of the metrics port
+  portName: metrics
+
 controller:
   # enabled defines whether to apply the Akri Controller
   enabled: true
@@ -23,27 +43,42 @@ controller:
     # repository is the Akri Controller container reference
     repository: ghcr.io/deislabs/akri/controller
     # tag is the Akri Controller container tag
-    # controller.yaml will default to v(AppVersion)-dev
+    # controller.yaml will default to v(AppVersion)[-dev]
+    # with `-dev` added if `useDevelopmentContainers` is specified
     tag:
     # pullPolicy is the Akri Controller pull policy
-    pullPolicy: Always
-  # onlyOnMaster dictates whether the Akri Controller will only run on a master node
-  onlyOnMaster: true
+    pullPolicy: ""
+  # onlyOnControlPlane dictates whether the Akri Controller will only run on nodes with 
+  # the label with (key, value) of ("node-role.kubernetes.io/master", "")
+  onlyOnControlPlane: false
+  # allowOnControlPlane dictates whether a toleration will be added to allow to Akri Controller 
+  # to run on the control plane node
+  allowOnControlPlane: true
   # linuxOnly dictates whether the Akri Controller will only run on a linux node
   linuxOnly: true
+  # nodeSelectors is the array of nodeSelectors used to target nodes for the Akri Controller to run on
+  # This can be set from the helm command line using `--set controller.nodeSelectors.label="value"`
+  nodeSelectors: {}
 
 agent:
   # enabled defines whether to apply the Akri Agent
   enabled: true
+  # slim specifies that discovery handlers will be run outside of the Agent
+  slim: false
   image:
     # repository is the Akri Agent container reference
     repository: ghcr.io/deislabs/akri/agent
     # tag is the Akri Agent container tag
-    # agent.yaml will default to v(AppVersion)-dev
+    # agent.yaml will default to v(AppVersion)[-dev]
+    # with `-dev` added if `useDevelopmentContainers` is specified
     tag:
     # pullPolicy is the Akri Agent pull policy
-    pullPolicy: Always
+    pullPolicy: ""
+  securityContext: {}
   host:
+    # discoveryHandlers is the location of Akri Discovery Handler sockets and
+    # the agent registration service
+    discoveryHandlers: /var/lib/akri
     # kubeletDevicePlugins is the location of the kubelet device-plugin sockets
     kubeletDevicePlugins: /var/lib/kubelet/device-plugins
     # crictl is the node path to crictl
@@ -57,6 +92,74 @@ agent:
   # linuxOnly dictates whether the Akri Agent will only run on a linux node
   linuxOnly: true
 
+customDiscovery:
+  # enabled defines whether to load a customDiscovery configuration
+  enabled: false
+  # name is the Kubernetes resource name that will be created for this
+  # customDiscovery configuration
+  name: akri-custom-discovery
+  # discoveryHandlerName is the name the Discovery Handler is expected to register under
+  discoveryHandlerName: 
+  # properties is a map of properties that will be passed to any instances
+  # created as a result of applying this customDiscovery configuration
+  properties:
+  # capacity is the capacity for any instances created as a result of
+  # applying this customDiscovery configuration
+  capacity: 1
+  # discoveryDetails is the string of discovery details that is 
+  # passed to a Discovery Handler which can parse it into an expected format.
+  discoveryDetails: ""
+  brokerPod:
+    image:
+      # repository is the customDiscovery broker container reference
+      repository:
+      # tag is the customDiscovery broker image tag
+      tag: latest
+      # pullPolicy is the customDiscovery pull policy
+      pullPolicy: ""
+  # createInstanceServices is specified if a service should automatically be
+  # created for each broker pod
+  createInstanceServices: true
+  instanceService:
+    # name is the description of the instance service
+    name: akri-custom-discovery-instance-service
+    # type is the service type of the instance service
+    type: ClusterIP
+    # port is the service port of the instance service
+    port: 6052
+    # targetPort is the service targetPort of the instance service
+    targetPort: 6052
+    # protocol is the service protocol of the instance service
+    protocol: TCP
+  # createConfigurationService is specified if a single service should automatically be
+  # created for all broker pods of a Configuration
+  createConfigurationService: true
+  configurationService:
+    # name is the description of the configuration service
+    name: akri-custom-discovery-configuration-service
+    # type is the service type of the instance service
+    type: ClusterIP
+    # port is the service port of the instance service
+    port: 6052
+    # targetPort is the service targetPort of the instance service
+    targetPort: 6052
+    # protocol is the service protocol of the instance service
+    protocol: TCP
+  # discovery defines a set of values for a customDiscovery discovery handler DaemonSet
+  discovery: 
+    # enabled defines whether discovery handler pods will be deployed in a slim Agent scenario
+    enabled: false
+    image:
+      # repository is the customDiscovery broker container reference
+      repository:
+      # tag is the customDiscovery broker image tag
+      tag: latest
+      # pullPolicy is the pull policy
+      pullPolicy: ""
+    # nodeSelectors is the array of nodeSelectors used to target nodes for the discovery handler to run on
+    # This can be set from the helm command line using `--set customDiscovery.discovery.nodeSelectors.label="value"`
+    nodeSelectors: {}
+
 debugEcho:
   # enabled defines whether to load a debugEcho configuration
   enabled: false
@@ -68,20 +171,27 @@ debugEcho:
   properties:
   # capacity is the capacity for any instances created as a result of
   # applying this debugEcho configuration
-  capacity: 5
+  capacity: 1
   # descriptions is the list of instances created as a result of
   # applying this debugEcho configuration
   descriptions:
   - "foo0"
   - "foo1"
   # shared defines whether instances created as a result of
-  # applying this debugEcho configuration as shared
+  # applying this debugEcho configuration are shared
   shared: true
   brokerPod:
     # container used by debugEcho
-    image: nginx:latest
-    # pullPolicy is the debugEcho pull policy
-    pullPolicy: Always
+    image:
+      # repository is the debugEcho broker container reference
+      repository: nginx
+      # tag is the debugEcho broker image tag
+      tag: latest
+      # pullPolicy is the debugEcho pull policy
+      pullPolicy: ""
+  # createInstanceServices is specified if a service should automatically be
+  # created for each broker pod
+  createInstanceServices: true
   instanceService:
     # name is the description of the instance service
     name: akri-debug-echo-foo-instance-service
@@ -93,6 +203,9 @@ debugEcho:
     targetPort: 6052
     # protocol is the service protocol of the instance service
     protocol: TCP
+  # createConfigurationService is specified if a single service should automatically be
+  # created for all broker pods of a Configuration
+  createConfigurationService: true
   configurationService:
     # name is the description of the configuration service
     name: akri-debug-echo-foo-configuration-service
@@ -104,15 +217,37 @@ debugEcho:
     targetPort: 6052
     # protocol is the service protocol of the instance service
     protocol: TCP
+  # discovery defines a set of values for a debugEcho discovery handler DaemonSet
+  discovery: 
+    # enabled defines whether discovery handler pods will be deployed in a slim Agent scenario
+    enabled: false
+    image:
+      # repository is the container reference
+      repository: ghcr.io/deislabs/akri/debug-echo-discovery
+      # tag is the container tag
+      # debugEcho.yaml will default to v(AppVersion)[-dev]
+      # with `-dev` added if `useDevelopmentContainers` is specified
+      tag:
+      # pullPolicy is the pull policy
+      pullPolicy: ""
+    # useNetworkConnection specifies whether the discovery handler should make a networked connection
+    # with Agents, using its pod IP address when registering
+    useNetworkConnection: false
+    # port specifies (when useNetworkConnection is true) the port on which the discovery handler advertises its discovery service
+    port: 10000
+    # nodeSelectors is the array of nodeSelectors used to target nodes for the discovery handler to run on
+    # This can be set from the helm command line using `--set debugEcho.discovery.nodeSelectors.label="value"`
+    nodeSelectors: {}
 
-onvifVideo:
-  # enabled defines whether to load a onvifVideo configuration
+
+onvif:
+  # enabled defines whether to load a onvif configuration
   enabled: false
   # name is the Kubernetes resource name that will be created for this
-  # onvifVideo configuration
-  name: akri-onvif-video
+  # onvif configuration
+  name: akri-onvif
   # properties is a map of properties that will be passed to any instances
-  # created as a result of applying this onvifVideo configuration
+  # created as a result of applying this onvif configuration
   properties:
   ipAddresses: 
     action: Exclude
@@ -125,77 +260,110 @@ onvifVideo:
     items: []
   discoveryTimeoutSeconds: 1
   # capacity is the capacity for any instances created as a result of
-  # applying this onvifVideo configuration
-  capacity: 5
+  # applying this onvif configuration
+  capacity: 1
   brokerPod:
     image:
-      # repository is the Akri onvif broker container reference
-      repository: ghcr.io/deislabs/akri/onvif-video-broker
-      # tag is the Akri onvif broker container tag
-      # akri-onvif-video.yaml will default to
-      # v(AppVersion)-dev
-      tag:
+      # repository is the onvif broker container reference
+      repository:
+      # tag is the onvif broker image tag
+      tag: latest
       # pullPolicy is the Akri onvif broker pull policy
-      pullPolicy: Always
+      pullPolicy: ""
+  # createInstanceServices is specified if a service should automatically be
+  # created for each broker pod
+  createInstanceServices: true
   instanceService:
     # name is the description of the instance service
-    name: akri-onvif-video-instance-service
+    name: akri-onvif-instance-service
     # type is the service type of the instance service
     type: ClusterIP
+    # portName is the name of the port
+    portName: grpc
     # port is the service port of the instance service
     port: 80
     # targetPort is the service targetPort of the instance service
     targetPort: 8083
     # protocol is the service protocol of the instance service
     protocol: TCP
+  # createConfigurationService is specified if a single service should automatically be
+  # created for all broker pods of a Configuration
+  createConfigurationService: true
   configurationService:
     # name is the description of the configuration service
-    name: akri-onvif-video-configuration-service
+    name: akri-onvif-configuration-service
     # type is the service type of the instance service
     type: ClusterIP
+    # portName is the name of the port
+    portName: grpc
     # port is the service port of the instance service
     port: 80
     # targetPort is the service targetPort of the instance service
     targetPort: 8083
     # protocol is the service protocol of the instance service
     protocol: TCP
+  # discovery defines a set of values for a onvif discovery handler DaemonSet
+  discovery: 
+    # enabled defines whether discovery handler pods will be deployed in a slim Agent scenario
+    enabled: false
+    image:
+      # repository is the container reference
+      repository: ghcr.io/deislabs/akri/onvif-discovery
+      # tag is the container tag
+      # onvif.yaml will default to v(AppVersion)[-dev]
+      # with `-dev` added if `useDevelopmentContainers` is specified
+      tag:
+      # pullPolicy is the pull policy
+      pullPolicy: ""
+    # useNetworkConnection specifies whether the discovery handler should make a networked connection
+    # with Agents, using its pod IP address when registering
+    useNetworkConnection: false
+    # port specifies (when useNetworkConnection is true) the port on which the discovery handler advertises its discovery service
+    port: 10000
+    # nodeSelectors is the array of nodeSelectors used to target nodes for the discovery handler to run on
+    # This can be set from the helm command line using `--set onvif.discovery.nodeSelectors.label="value"`
+    nodeSelectors: {}
 
-udevVideo:
-  # enabled defines whether to load a udevVideo configuration
+opcua:
+  # enabled defines whether to load an OPC UA configuration
   enabled: false
   # name is the Kubernetes resource name that will be created for this
-  # udevVideo configuration
-  name: akri-udev-video
+  # OPC UA configuration
+  name: akri-opcua
   # properties is a map of properties that will be passed to any instances
-  # created as a result of applying this udevVideo configuration
+  # created as a result of applying this OPC UA configuration
   properties:
-  # udevRules is the list of udev rules used to find instances created as a result of
-  # applying this debugEcho configuration
-  udevRules:
-  - 'KERNEL=="video[0-9]*"'
+  opcuaDiscoveryMethod: standard
+  # discoveryUrls is a list of DiscoveryUrls for OPC UA servers
+  discoveryUrls:
+  - "opc.tcp://localhost:4840/"
+  # mountCertificates determines whether to mount into the broker pods k8s Secrets 
+  # containing OPC UA client credentials for connecting to OPC UA severs with the 
+  # same signing certificate authority.
+  # If set to false, the brokers will attempt to make an insecure connection with the servers.
+  mountCertificates: false
+  # applicationNames is a filter applied to the discovered OPC UA servers to either exclusively
+  # include or exclude servers with application names in the applicationNames list.
+  applicationNames:
+    action: Exclude
+    items: []
   # capacity is the capacity for any instances created as a result of
-  # applying this udevVideo configuration
-  capacity: 5
+  # applying this OPC UA configuration
+  capacity: 1
   brokerPod:
     image:
-      # repository is the Akri udev broker container reference
-      repository: ghcr.io/deislabs/akri/udev-video-broker
-      # tag is the Akri udev broker container tag
-      # akri-udev-video.yaml will default to
-      # v(AppVersion)-dev
-      tag:
-      # pullPolicy is the Akri udev broker pull policy
-      pullPolicy: Always
-    env:
-      # format is the format v4l2 should use to read from the camera
-      format: "MJPG"
-      # width is the frame width v4l2 should use to read from the camera
-      width: "640"
-      # height is the frame height v4l2 should use to read from the camera
-      height: "480"
-      # fps is the frames per second v4l2 should use to read from the camera
-      fps: "10"
+      # repository is the OPC UA broker container reference
+      repository:
+      # tag is the OPC UA broker image tag
+      tag: latest
+      # pullPolicy is the OPC UA broker pull policy
+      pullPolicy: ""
+  # createInstanceServices is specified if a service should automatically be
+  # created for each broker pod
+  createInstanceServices: true
   instanceService:
+    # name is the description of the instance service
+    name: akri-opcua-instance-service
     # type is the service type of the instance service
     type: ClusterIP
     # port is the service port of the instance service
@@ -204,7 +372,12 @@ udevVideo:
     targetPort: 8083
     # protocol is the service protocol of the instance service
     protocol: TCP
+  # createConfigurationService is specified if a single service should automatically be
+  # created for all broker pods of a Configuration
+  createConfigurationService: true
   configurationService:
+    # name is the description of the configuration service
+    name: akri-opcua-configuration-service
     # type is the service type of the instance service
     type: ClusterIP
     # port is the service port of the instance service
@@ -213,7 +386,128 @@ udevVideo:
     targetPort: 8083
     # protocol is the service protocol of the instance service
     protocol: TCP
+  # discovery defines a set of values for a opcua discovery handler DaemonSet
+  discovery: 
+    # enabled defines whether discovery handler pods will be deployed in a slim Agent scenario
+    enabled: false
+    image:
+      # repository is the container reference
+      repository: ghcr.io/deislabs/akri/opcua-discovery
+      # tag is the container tag
+      # opcua.yaml will default to v(AppVersion)[-dev]
+      # with `-dev` added if `useDevelopmentContainers` is specified
+      tag:
+      # pullPolicy is the pull policy
+      pullPolicy: ""
+    # useNetworkConnection specifies whether the discovery handler should make a networked connection
+    # with Agents, using its pod IP address when registering
+    useNetworkConnection: false
+    # port specifies (when useNetworkConnection is true) the port on which the discovery handler advertises its discovery service
+    port: 10000
+    # nodeSelectors is the array of nodeSelectors used to target nodes for the discovery handler to run on
+    # This can be set from the helm command line using `--set opcua.discovery.nodeSelectors.label="value"`
+    nodeSelectors: {}
 
 
+udev:
+  # enabled defines whether to load a udev configuration
+  enabled: false
+  # name is the Kubernetes resource name that will be created for this
+  # udev configuration
+  name: akri-udev
+  # properties is a map of properties that will be passed to any instances
+  # created as a result of applying this udev configuration
+  properties:
+  # udevRules is the list of udev rules used to find instances created as a result of
+  # applying this udev configuration
+  udevRules:
+  # capacity is the capacity for any instances created as a result of
+  # applying this udev configuration
+  capacity: 1
+  brokerPod:
+    image:
+      # repository is the udev broker container reference
+      repository:
+      # tag is the udev broker image tag
+      tag: latest
+      # pullPolicy is the udev broker pull policy
+      pullPolicy: ""
+    securityContext: {}
+  # createInstanceServices is specified if a service should automatically be
+  # created for each broker pod
+  createInstanceServices: true
+  instanceService:
+    # portName is the name of the port
+    portName: grpc
+    # type is the service type of the instance service
+    type: ClusterIP
+    # port is the service port of the instance service
+    port: 80
+    # targetPort is the service targetPort of the instance service
+    targetPort: 8083
+    # protocol is the service protocol of the instance service
+    protocol: TCP
+  # createConfigurationService is specified if a single service should automatically be
+  # created for all broker pods of a Configuration
+  createConfigurationService: true
+  configurationService:
+    # portName is the name of the port
+    portName: grpc
+    # type is the service type of the instance service
+    type: ClusterIP
+    # port is the service port of the instance service
+    port: 80
+    # targetPort is the service targetPort of the instance service
+    targetPort: 8083
+    # protocol is the service protocol of the instance service
+    protocol: TCP
+  # discovery defines a set of values for a udev discovery handler DaemonSet
+  discovery: 
+    # enabled defines whether discovery handler pods will be deployed in a slim Agent scenario
+    enabled: false
+    image:
+      # repository is the container reference
+      repository: ghcr.io/deislabs/akri/udev-discovery
+      # tag is the container tag
+      # udev.yaml will default to v(AppVersion)[-dev]
+      # with `-dev` added if `useDevelopmentContainers` is specified
+      tag:
+      # pullPolicy is the pull policy
+      pullPolicy: ""
+    # useNetworkConnection specifies whether the discovery handler should make a networked connection
+    # with Agents, using its pod IP address when registering
+    useNetworkConnection: false
+    # port specifies (when useNetworkConnection is true) the port on which the discovery handler advertises its discovery service
+    port: 10000
+    # nodeSelectors is the array of nodeSelectors used to target nodes for the discovery handler to run on
+    # This can be set from the helm command line using `--set udev.discovery.nodeSelectors.label="value"`
+    nodeSelectors: {}
 
-
+# Admission Controllers (Webhooks)
+webhookConfiguration:
+  # enabled defines whether to apply the Akri Admission Controller (Webhook) for Akri Configurations
+  enabled: false
+  # name of the webhook
+  name: akri-webhook-configuration
+  # base64-encoded CA certificate (PEM) used by Kubernetes to validate the Webhook's certificate
+  caBundle: null
+  image:
+    # repository is the Akri Webhook for Configurations image reference
+    repository: ghcr.io/deislabs/akri/webhook-configuration
+    # tag is the container tag
+    # webhook-configuration.yaml will default to v(AppVersion)[-dev]
+    # with `-dev` added if `useDevelopmentContainers` is specified
+    tag:
+    # pullPolicy is the Akri Webhook pull policy
+    pullPolicy: Always
+  # onlyOnControlPlane dictates whether the Akri Webhook will only run on nodes with 
+  # the label with (key, value) of ("node-role.kubernetes.io/master", "")
+  onlyOnControlPlane: false
+  # allowOnControlPlane dictates whether a toleration will be added to allow to Akri Webhook 
+  # to run on the control plane node
+  allowOnControlPlane: true
+  # linuxOnly dictates whether the Akri Webhook will only run on a linux node
+  linuxOnly: true
+  # nodeSelectors is the array of nodeSelectors used to target nodes for the Akri Webhook to run on
+  # This can be set from the helm command line using `--set webhookConfiguration.nodeSelectors.label="value"`
+  nodeSelectors: {}

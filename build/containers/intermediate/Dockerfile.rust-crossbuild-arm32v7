@@ -9,7 +9,7 @@
 # Cross.toml to point at the new versions.
 #
 
-FROM rustembedded/cross:arm-unknown-linux-gnueabihf-0.1.16
+FROM rustembedded/cross:armv7-unknown-linux-gnueabihf-0.1.16
 
 RUN sed -i 's/^deb h'/'deb [arch=amd64,i386] h/' /etc/apt/sources.list && \
     dpkg --add-architecture armhf && \
@@ -20,6 +20,9 @@ RUN sed -i 's/^deb h'/'deb [arch=amd64,i386] h/' /etc/apt/sources.list && \
     apt-get install -y --no-install-recommends pkg-config:armhf \
             g++ ca-certificates curl libssl-dev:armhf \
             libv4l-dev:armhf libudev-dev:armhf
+
+# Link the container to the Akri repository
+LABEL org.opencontainers.image.source https://github.com/deislabs/akri
 
 # Copy over container legal notice
 COPY ./build/container-images-legal-notice.md .

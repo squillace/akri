@@ -1,14 +1,13 @@
+#!/bin/bash
 
-apt_dependencies="git curl libssl-dev pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav libgstrtspserver-1.0-dev libges-1.0-dev libudev-dev libv4l-dev"
+# exit on failures
+set -ex
 
 echo "User: $(whoami)"
 
-echo "Install rustfmt"
-rustup component add rustfmt
-
+apt_dependencies="git curl libssl-dev pkg-config libudev-dev libv4l-dev"
 echo "Install dependencies: $apt_dependencies"
-which sudo > /dev/null 2>&1
-if [ "$?" -eq "0" ];
+if [ -x "$(command -v sudo)" ];
 then
     echo "Run sudo apt install ..."
     sudo apt update
@@ -19,3 +18,21 @@ else
     apt install -y $apt_dependencies
 fi
 
+if ! [ -x "$(command -v rustup)" ];
+then
+    if [ -x "$(command -v sudo)" ];
+    then
+        echo "Install rustup"
+        sudo curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain=1.49.0
+    else
+        echo "Install rustup"
+        curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain=1.49.0
+    fi
+else
+    echo "Found rustup"
+fi
+
+echo "Install rustfmt"
+rustup component add rustfmt
+
+exit 0
